@@ -40,6 +40,16 @@ const allowedOrigins = [
   'https://api-kuberfashion.femur.studio'
 ];
 
+// Dynamically add origins from environment variables
+if (process.env.CORS_ORIGIN) {
+  const envOrigins = process.env.CORS_ORIGIN.split(',').map(o => o.trim());
+  envOrigins.forEach(origin => {
+    if (!allowedOrigins.includes(origin)) {
+      allowedOrigins.push(origin);
+    }
+  });
+}
+
 // Helper function to check if origin is allowed
 const isOriginAllowed = (origin) => {
   if (!origin) return true;
