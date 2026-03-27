@@ -9,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('../utils/logger');
 const PDFDocument = require('pdfkit');
+const jwt = require('jsonwebtoken');
 
 // Configure multer for file uploads
 const upload = multer({ dest: 'uploads/' });
@@ -145,6 +146,68 @@ const deleteUser = async (req, res, next) => {
             message: 'User deleted successfully'
         });
     } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   POST /api/admin/users/:id/impersonate
+ * @desc    Generate an impersonation token for a target user
+ * @access  Admin only
+ */
+const impersonateUser = async (req, res, next) => {
+    try {
+        const targetUserId = req.params.id;
+
+        // Fetch user from DB
+        const user = await User.findById(targetUserId);
+
+        if (!user) {
+            return res.status(404).json({
+                error: 'Not Found',
+                message: 'Target user not found'
+            });
+        }
+        
+        // Prevent impersonating another Admin (security measure)
+        if (user.role === 'Admin') {
+            return res.status(403).json({
+                error: 'Forbidden',
+                message: 'Cannot impersonate another Admin'
+            });
+        }
+
+        // Generate JWT token for target user
+        const token = jwt.sign(
+            {
+                id: user.id,
+                email: user.email,
+                role: user.role
+            },
+            process.env.JWT_SECRET,
+            {
+                expiresIn: process.env.JWT_EXPIRES_IN || '24h'
+            }
+        );
+
+        logger.info('Auth', `Admin ${req.user.id} initiated impersonation for user ${user.id} (${user.email})`);
+
+        // Return user data and token 
+        res.json({
+            message: 'Impersonation successful',
+            token,
+            user: {
+                id: user.id,
+                username: user.username,
+                name: user.name,
+                email: user.email,
+                role: user.role,
+                wallet_balance: user.wallet_balance,
+                profile_image: user.profile_image
+            }
+        });
+    } catch (error) {
+        logger.error('Admin:Impersonate', error, { targetId: req.params.id });
         next(error);
     }
 };
@@ -357,26 +420,8 @@ const updateWebsite = async (req, res, next) => {
  * @desc    Delete website
  * @access  Admin only
  */
-const deleteWebsite = async (req, res, next) => {
-    try {
-        const { id } = req.params;
+// Original deleteWebsite removed as it was redeclared below to use soft-deletes via database queries instead of the undefined Website model.
 
-        const website = await Website.delete(id);
-
-        if (!website) {
-            return res.status(404).json({
-                error: 'Not Found',
-                message: 'Website not found'
-            });
-        }
-
-        res.json({
-            message: 'Website deleted successfully'
-        });
-    } catch (error) {
-        next(error);
-    }
-};
 
 // ==================== DASHBOARD STATISTICS ====================
 
@@ -724,6 +769,11 @@ const getPaymentHistory = async (req, res, next) => {
     try {
         const {
             search,
+            filter_name,
+            filter_email,
+            filter_payment_method,
+            filter_status,
+            filter_clearance_date,
             sort_by = 'created_at',
             sort_order = 'desc',
             page = 1,
@@ -737,14 +787,6 @@ const getPaymentHistory = async (req, res, next) => {
         // Base Table: withdraw_requests
         // Join users for payment details (Bank, UPI, QR, etc.)
         // Join wallet_histories for Amount and Remarks
-        // This targets the ~3000 transactions mentioned by user
-
-        let countSql = `
-            SELECT COUNT(*) as total
-            FROM withdraw_requests wr
-            JOIN users u ON wr.user_id = u.id
-            WHERE 1=1 
-        `;
 
         let sql = `
             SELECT 
@@ -793,29 +835,58 @@ const getPaymentHistory = async (req, res, next) => {
             LEFT JOIN wallet_histories wh ON wh.withdraw_request_id = wr.id
             LEFT JOIN new_order_process_details nopd ON wh.order_detail_id = nopd.id
             LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
-            WHERE 1=1
+            WHERE wr.status = 1
         `;
 
         const params = [];
-        const countParams = [];
         let paramIndex = 1;
-        let countParamIndex = 1;
 
+        // --- PRE-GROUP-BY WHERE filters ---
         if (search) {
-            const searchCondition = ` AND (u.name ILIKE $${paramIndex} OR u.email ILIKE $${paramIndex})`;
-            sql += searchCondition;
-            countSql += ` AND (u.name ILIKE $${countParamIndex} OR u.email ILIKE $${countParamIndex})`;
+            sql += ` AND (u.name ILIKE $${paramIndex} OR u.email ILIKE $${paramIndex})`;
             params.push(`%${search}%`);
-            countParams.push(`%${search}%`);
             paramIndex++;
-            countParamIndex++;
         }
+
+        if (filter_name) {
+            sql += ` AND u.name ILIKE $${paramIndex}`;
+            params.push(`%${filter_name}%`);
+            paramIndex++;
+        }
+
+        if (filter_email) {
+            sql += ` AND u.email ILIKE $${paramIndex}`;
+            params.push(`%${filter_email}%`);
+            paramIndex++;
+        }
+
+        // Status is always 1 (Paid)
 
         // Group by for aggregation
         sql += ` GROUP BY wr.id, u.id `;
 
-        // Get total count
-        const countResult = await query(countSql, countParams);
+        // --- POST-GROUP-BY HAVING filters (for aggregated columns) ---
+        const havingClauses = [];
+
+        if (filter_payment_method) {
+            havingClauses.push(`MAX(wh.payment_method) ILIKE $${paramIndex}`);
+            params.push(`%${filter_payment_method}%`);
+            paramIndex++;
+        }
+
+        if (filter_clearance_date) {
+            havingClauses.push(`DATE(MAX(wh.approved_date)) = $${paramIndex}::date`);
+            params.push(filter_clearance_date);
+            paramIndex++;
+        }
+
+        if (havingClauses.length > 0) {
+            sql += ` HAVING ${havingClauses.join(' AND ')} `;
+        }
+
+        // --- Get total count using the same filters (wrap in subquery) ---
+        const countSql = `SELECT COUNT(*) as total FROM (${sql}) as filtered`;
+        const countResult = await query(countSql, params.slice()); // use same params without LIMIT/OFFSET
         const total = parseInt(countResult.rows[0]?.total || 0);
 
         // Sorting
@@ -826,7 +897,7 @@ const getPaymentHistory = async (req, res, next) => {
         // Handle sort column mapping
         let orderByClause = '';
         if (sortColumn === 'user_name') orderByClause = `u.name ${sortDirection}`;
-        else if (sortColumn === 'amount') orderByClause = `amount ${sortDirection}`; // alias usage might require subquery in some SQL dialects but Postgres allows in ORDER BY
+        else if (sortColumn === 'amount') orderByClause = `amount ${sortDirection}`;
         else if (sortColumn === 'created_at') orderByClause = `wr.created_at ${sortDirection}`;
         else if (sortColumn === 'updated_at') orderByClause = `wr.updated_at ${sortDirection}`;
 
@@ -938,7 +1009,7 @@ const getWithdrawalRequests = async (req, res, next) => {
         // Format invoice number
         const withdrawals = result.rows.map(row => ({
             ...row,
-            invoice_number: row.invoice_pre ? `${row.invoice_pre}${row.invoice_number}` : `LM${row.invoice_number || row.id}`,
+            invoice_number: row.invoice_pre ? `${row.invoice_pre}${row.invoice_number}` : (row.invoice_number || (100000 + parseInt(row.id))),
             status_text: row.status === 0 ? 'Pending' : row.status === 1 ? 'Approved' : 'Rejected'
         }));
 
@@ -1025,7 +1096,7 @@ const getWithdrawalRequestDetail = async (req, res, next) => {
                 ...withdrawal,
                 invoice_number: withdrawal.invoice_pre
                     ? `${withdrawal.invoice_pre}${withdrawal.invoice_number}`
-                    : `LM${withdrawal.invoice_number || withdrawal.id}`,
+                    : (withdrawal.invoice_number || (100000 + parseInt(withdrawal.id))),
                 total_amount: totalAmount
             },
             orders: ordersResult.rows.map(o => ({
@@ -1395,6 +1466,20 @@ const confirmSitesExcel = async (req, res, next) => {
         let ignored = 0;
         const importErrors = [];
 
+        // Helper to resolve blogger ID from email
+        const resolveBloggerId = async (email) => {
+            if (email && email.trim()) {
+                const userLookup = await query(
+                    "SELECT id FROM users WHERE email = $1 LIMIT 1",
+                    [email.trim()]
+                );
+                if (userLookup.rows.length > 0) {
+                    return userLookup.rows[0].id;
+                }
+            }
+            return null;
+        };
+
         for (const site of sites) {
             try {
                 // If site has a resolution field, it came from a conflict
@@ -1410,19 +1495,75 @@ const confirmSitesExcel = async (req, res, next) => {
                     continue;
                 }
 
+                const parseNum = (val) => {
+                    if (val === null || val === undefined || val === '' || String(val).trim().toUpperCase() === 'N/A') return null;
+                    // Extract numbers, decimal points from string like "72 Hours", "$10"
+                    const parsed = parseFloat(String(val).replace(/[^0-9.-]/g, ''));
+                    return isNaN(parsed) ? null : parsed;
+                };
+
+                const da = parseNum(site.da);
+                const dr = parseNum(site.dr);
+                const traffic = parseNum(site.traffic);
+                const rd = parseNum(site.rd);
+                const fc_gp = parseNum(site.fc_gp);
+                const fc_ne = parseNum(site.fc_ne);
+                const total_time = parseNum(site.total_time);
+
                 if (resolution === 'REPLACE') {
-                    // Delete existing and re-insert
-                    await query('DELETE FROM new_sites WHERE root_domain = $1', [site.root_domain]);
+                    // Preserve existing blogger ID before deleting
+                    const existingRow = await query(
+                        'SELECT uploaded_user_id FROM new_sites WHERE root_domain = $1 LIMIT 1',
+                        [site.root_domain]
+                    );
+                    const existingBloggerId = existingRow.rows[0]?.uploaded_user_id;
+
+                    // Retain existing site but mark as Rejected
+                    await query(
+                        `UPDATE new_sites 
+                         SET website_status = 'Rejected', site_status = '2', updated_at = CURRENT_TIMESTAMP 
+                         WHERE root_domain = $1`, 
+                        [site.root_domain]
+                    );
+
+                    // Resolve blogger: email lookup → existing owner → admin fallback
+                    const emailBloggerId = await resolveBloggerId(site.email);
+                    const bloggerId = emailBloggerId || existingBloggerId || req.user.id;
+
+                    // Re-insert with correct blogger ID
+                    await query(
+                        `INSERT INTO new_sites (
+                            root_domain, niche, category, da, dr, traffic, traffic_source, rd, 
+                            gp_price, niche_edit_price, fc_gp, fc_ne, spam_score, word_count, 
+                            sample_url, email, whatsapp, skype, paypal_id, country_source,
+                            website_niche, website_status, marked_sponsor, accept_grey_niche,
+                            total_time, href_url, site_status, uploaded_user_id,
+                            domain_type, association_type, created_at, updated_at
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                        [
+                            site.root_domain, site.niche || '', site.category || '',
+                            da, dr, traffic, site.traffic_source, rd,
+                            site.gp_price || '', site.niche_edit_price || '', fc_gp, fc_ne,
+                            site.spam_score, site.word_count, site.sample_url || '', site.email || '',
+                            site.whatsapp || '', site.skype || '', site.paypal_id || '', site.country_source || '',
+                            site.website_niche || '', site.website_status || '', site.marked_sponsor || '',
+                            site.accept_grey_niche || '', total_time, site.href_url || '',
+                            site.site_status || '1', bloggerId,
+                            site.domain_type || '', site.association_type || ''
+                        ]
+                    );
+                    replaced++;
+                    continue; // Skip the rest — REPLACE is fully handled
                 }
 
-                // Check if domain exists (for ADD or after REPLACE delete)
+                // Check if domain exists (for ADD or new sites)
                 const existingCheck = await query(
                     'SELECT id FROM new_sites WHERE root_domain = $1 LIMIT 1',
                     [site.root_domain]
                 );
 
                 if (existingCheck.rows.length > 0 && resolution !== 'ADD') {
-                    // Update existing
+                    // Update existing (shouldn't normally reach here, but safety net)
                     await query(
                         `UPDATE new_sites SET
                             niche = COALESCE(NULLIF($2, ''), niche),
@@ -1454,17 +1595,20 @@ const confirmSitesExcel = async (req, res, next) => {
                         WHERE root_domain = $1`,
                         [
                             site.root_domain, site.niche || '', site.category || '',
-                            site.da, site.dr, site.traffic, site.traffic_source, site.rd,
-                            site.gp_price || '', site.niche_edit_price || '', site.fc_gp, site.fc_ne,
+                            da, dr, traffic, site.traffic_source, rd,
+                            site.gp_price || '', site.niche_edit_price || '', fc_gp, fc_ne,
                             site.spam_score, site.word_count, site.sample_url || '', site.email || '',
                             site.whatsapp || '', site.skype || '', site.paypal_id || '', site.country_source || '',
                             site.website_niche || '', site.website_status || '', site.marked_sponsor || '',
-                            site.accept_grey_niche || '', site.total_time, site.href_url || ''
+                            site.accept_grey_niche || '', total_time, site.href_url || ''
                         ]
                     );
                     replaced++;
                 } else {
-                    // Insert new site
+                    // Insert new site — resolve blogger from email
+                    const emailBloggerId = await resolveBloggerId(site.email);
+                    const bloggerId = emailBloggerId || req.user.id;
+
                     await query(
                         `INSERT INTO new_sites (
                             root_domain, niche, category, da, dr, traffic, traffic_source, rd, 
@@ -1476,13 +1620,13 @@ const confirmSitesExcel = async (req, res, next) => {
                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
                         [
                             site.root_domain, site.niche || '', site.category || '',
-                            site.da, site.dr, site.traffic, site.traffic_source, site.rd,
-                            site.gp_price || '', site.niche_edit_price || '', site.fc_gp, site.fc_ne,
+                            da, dr, traffic, site.traffic_source, rd,
+                            site.gp_price || '', site.niche_edit_price || '', fc_gp, fc_ne,
                             site.spam_score, site.word_count, site.sample_url || '', site.email || '',
                             site.whatsapp || '', site.skype || '', site.paypal_id || '', site.country_source || '',
                             site.website_niche || '', site.website_status || '', site.marked_sponsor || '',
-                            site.accept_grey_niche || '', site.total_time, site.href_url || '',
-                            site.site_status || '1', req.user.id,
+                            site.accept_grey_niche || '', total_time, site.href_url || '',
+                            site.site_status || '1', bloggerId,
                             site.domain_type || '', site.association_type || ''
                         ]
                     );
@@ -1814,7 +1958,7 @@ const getWebsitesList = async (req, res, next) => {
         const offset = (page - 1) * limit;
 
         // Build dynamic WHERE conditions as an array
-        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`, `ns.site_status = '1'`];
+        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`];
         const queryParams = [];
         let paramIndex = 1;
 
@@ -1842,13 +1986,15 @@ const getWebsitesList = async (req, res, next) => {
 
         // Dropdown Filters
         if (req.query.filter_website_status) {
-            conditions.push(`ns.website_status = $${paramIndex}`);
-            queryParams.push(req.query.filter_website_status);
+            conditions.push(`ns.site_status = $${paramIndex}`);
+            const val = req.query.filter_website_status === 'Approved' ? '1' : req.query.filter_website_status === 'Rejected' ? '2' : '0';
+            queryParams.push(val);
             paramIndex++;
         }
         if (req.query.filter_status && !req.query.filter_website_status) {
-            conditions.push(`ns.website_status = $${paramIndex}`);
-            queryParams.push(req.query.filter_status);
+            conditions.push(`ns.site_status = $${paramIndex}`);
+            const val = req.query.filter_status === 'Approved' ? '1' : req.query.filter_status === 'Rejected' ? '2' : '0';
+            queryParams.push(val);
             paramIndex++;
         }
         if (req.query.filter_fc_gp) {
@@ -1877,7 +2023,9 @@ const getWebsitesList = async (req, res, next) => {
                 let sqlOp = '=';
                 if (op === '>') sqlOp = '>';
                 else if (op === '<') sqlOp = '<';
-                conditions.push(`COALESCE(${dbCol}::numeric, 0) ${sqlOp} $${paramIndex}`);
+                
+                const castCol = `(CASE WHEN ${dbCol}::text ~ '^[0-9]+(\\.[0-9]+)?$' THEN ${dbCol}::numeric ELSE 0 END)`;
+                conditions.push(`${castCol} ${sqlOp} $${paramIndex}`);
                 queryParams.push(parseFloat(val));
                 paramIndex++;
             }
@@ -1921,6 +2069,214 @@ const getWebsitesList = async (req, res, next) => {
         res.json({
             sites: result.rows,
             pagination: { page, limit, total, totalPages }
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   GET /api/admin/sites/deleted-list
+ * @desc    Get all deleted websites/sites for admin view (with pagination)
+ * @access  Admin only
+ */
+const getDeletedWebsitesList = async (req, res, next) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const offset = (page - 1) * limit;
+
+        // Build dynamic WHERE conditions as an array
+        const conditions = [`ns.delete_site = 1`];
+        const queryParams = [];
+        let paramIndex = 1;
+
+        // Text Search Filters
+        if (req.query.search_domain) {
+            conditions.push(`ns.root_domain ILIKE $${paramIndex}`);
+            queryParams.push(`%${req.query.search_domain}%`);
+            paramIndex++;
+        }
+        if (req.query.search_category) {
+            conditions.push(`(ns.category ILIKE $${paramIndex} OR ns.niche ILIKE $${paramIndex})`);
+            queryParams.push(`%${req.query.search_category}%`);
+            paramIndex++;
+        }
+        if (req.query.search_niche) {
+            conditions.push(`ns.website_niche ILIKE $${paramIndex}`);
+            queryParams.push(`%${req.query.search_niche}%`);
+            paramIndex++;
+        }
+        if (req.query.search_email) {
+            conditions.push(`ns.email ILIKE $${paramIndex}`);
+            queryParams.push(`%${req.query.search_email}%`);
+            paramIndex++;
+        }
+
+        // Dropdown Filters
+        if (req.query.filter_website_status) {
+            conditions.push(`ns.site_status = $${paramIndex}`);
+            const val = req.query.filter_website_status === 'Approved' ? '1' : req.query.filter_website_status === 'Rejected' ? '2' : '0';
+            queryParams.push(val);
+            paramIndex++;
+        }
+        if (req.query.filter_status && !req.query.filter_website_status) {
+            conditions.push(`ns.site_status = $${paramIndex}`);
+            const val = req.query.filter_status === 'Approved' ? '1' : req.query.filter_status === 'Rejected' ? '2' : '0';
+            queryParams.push(val);
+            paramIndex++;
+        }
+        if (req.query.filter_fc_gp) {
+            if (req.query.filter_fc_gp === 'yes') conditions.push(`(ns.fc_gp IS NOT NULL AND ns.fc_gp != '')`);
+            else if (req.query.filter_fc_gp === 'no') conditions.push(`(ns.fc_gp IS NULL OR ns.fc_gp = '')`);
+        }
+        if (req.query.filter_fc_ne) {
+            if (req.query.filter_fc_ne === 'yes') conditions.push(`(ns.fc_ne IS NOT NULL AND ns.fc_ne != '')`);
+            else if (req.query.filter_fc_ne === 'no') conditions.push(`(ns.fc_ne IS NULL OR ns.fc_ne = '')`);
+        }
+        if (req.query.filter_new_arrival) {
+            if (req.query.filter_new_arrival === 'yes') conditions.push(`ns.created_at >= NOW() - INTERVAL '7 days'`);
+            else if (req.query.filter_new_arrival === 'no') conditions.push(`ns.created_at < NOW() - INTERVAL '7 days'`);
+        }
+        if (req.query.filter_added_on) {
+            conditions.push(`DATE(ns.created_at) = $${paramIndex}`);
+            queryParams.push(req.query.filter_added_on);
+            paramIndex++;
+        }
+
+        // Numeric Range Filters helper
+        const addRangeFilter = (paramKey, dbCol) => {
+            const val = req.query[`filter_${paramKey}_val`];
+            const op = req.query[`filter_${paramKey}_op`];
+            if (val && op) {
+                let sqlOp = '=';
+                if (op === '>') sqlOp = '>';
+                else if (op === '<') sqlOp = '<';
+                
+                const castCol = `(CASE WHEN ${dbCol}::text ~ '^[0-9]+(\\.[0-9]+)?$' THEN ${dbCol}::numeric ELSE 0 END)`;
+                conditions.push(`${castCol} ${sqlOp} $${paramIndex}`);
+                queryParams.push(parseFloat(val));
+                paramIndex++;
+            }
+        };
+
+        addRangeFilter('da', 'ns.da');
+        addRangeFilter('dr', 'ns.dr');
+        addRangeFilter('rd', 'ns.rd');
+        addRangeFilter('traffic', 'ns.traffic_source');
+        addRangeFilter('gp_price', 'ns.gp_price');
+        addRangeFilter('niche_price', 'ns.niche_edit_price');
+
+        const whereClause = conditions.join(' AND ');
+
+        // Execute Count query (same filters, no pagination)
+        const countResult = await query(
+            `SELECT COUNT(*) as total FROM new_sites ns WHERE ${whereClause}`,
+            queryParams
+        );
+        const total = parseInt(countResult.rows[0].total);
+        const totalPages = Math.ceil(total / limit);
+
+        // Execute Data query (with pagination)
+        const dataParams = [...queryParams, limit, offset];
+        const result = await query(
+            `SELECT ns.id, ns.root_domain, ns.niche, ns.category,
+                ns.da, ns.dr, ns.rd, ns.spam_score, ns.traffic_source as traffic,
+                ns.gp_price, ns.niche_edit_price, ns.deal_cbd_casino,
+                ns.email, ns.site_status, ns.website_status,
+                ns.fc_gp, ns.fc_ne, ns.website_niche, ns.sample_url, ns.href_url,
+                ns.paypal_id, ns.skype, ns.whatsapp, ns.country_source,
+                ns.created_at, ns.updated_at,
+                (SELECT MAX(nopd.created_at) FROM new_order_process_details nopd WHERE nopd.new_site_id = ns.id) as lo_created_at
+             FROM new_sites ns
+             WHERE ${whereClause}
+             ORDER BY ns.created_at DESC
+             LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+            dataParams
+        );
+
+        res.json({
+            sites: result.rows,
+            pagination: { page, limit, total, totalPages }
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   PUT /api/admin/sites/:id/delete
+ * @desc    Soft delete a website
+ * @access  Admin only
+ */
+const deleteWebsite = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+
+        // Check for active/in-process orders using this site
+        const activeOrdersResult = await query(
+            `SELECT COUNT(DISTINCT no.id) as active_orders
+             FROM new_order_process_details nopd
+             JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+             JOIN new_orders no ON nop.new_order_id = no.id
+             WHERE nopd.new_site_id = $1
+               AND (nopd.submit_url IS NULL OR nopd.submit_url = '')
+               AND nop.status NOT IN (5, 11)`,
+            [id]
+        );
+
+        const activeCount = parseInt(activeOrdersResult.rows[0].active_orders);
+        if (activeCount > 0) {
+            return res.status(400).json({
+                message: `Cannot delete this site. There ${activeCount === 1 ? 'is' : 'are'} ${activeCount} active order(s) currently in process with this site. Please complete or remove these orders first.`
+            });
+        }
+
+        const result = await query(
+            `UPDATE new_sites 
+             SET delete_site = 1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1
+             RETURNING id, root_domain`,
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: 'Website not found' });
+        }
+
+        res.json({
+            message: 'Website marked as deleted successfully',
+            site: result.rows[0]
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   PUT /api/admin/sites/:id/restore
+ * @desc    Restore a soft-deleted website
+ * @access  Admin only
+ */
+const restoreWebsite = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+
+        const result = await query(
+            `UPDATE new_sites 
+             SET delete_site = 0, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1
+             RETURNING id, root_domain`,
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: 'Website not found' });
+        }
+
+        res.json({
+            message: 'Website restored successfully',
+            site: result.rows[0]
         });
     } catch (error) {
         next(error);
@@ -2552,7 +2908,7 @@ const getCountries = async (req, res, next) => {
     try {
         const result = await query(
             `SELECT id, name, payment_methods, created_at, updated_at
-             FROM countries_list
+             FROM countries
              ORDER BY name ASC`
         );
         res.json({ countries: result.rows });
@@ -2561,7 +2917,7 @@ const getCountries = async (req, res, next) => {
         if (error.code === '42P01') {
             try {
                 await query(`
-                    CREATE TABLE IF NOT EXISTS countries_list (
+                    CREATE TABLE IF NOT EXISTS countries (
                         id SERIAL PRIMARY KEY,
                         name VARCHAR(255) NOT NULL,
                         payment_methods TEXT,
@@ -2572,11 +2928,11 @@ const getCountries = async (req, res, next) => {
                 // Seed with default countries
                 for (const country of DEFAULT_COUNTRIES) {
                     await query(
-                        `INSERT INTO countries_list (name, payment_methods) VALUES ($1, $2)`,
+                        `INSERT INTO countries (name, payment_methods) VALUES ($1, $2)`,
                         [country.name, country.payment_methods]
                     );
                 }
-                const result = await query(`SELECT id, name, payment_methods FROM countries_list ORDER BY name ASC`);
+                const result = await query(`SELECT id, name, payment_methods FROM countries ORDER BY name ASC`);
                 res.json({ countries: result.rows });
             } catch (seedError) {
                 next(seedError);
@@ -2601,7 +2957,7 @@ const createCountry = async (req, res, next) => {
         }
 
         const result = await query(
-            `INSERT INTO countries_list (name, payment_methods)
+            `INSERT INTO countries (name, payment_methods)
              VALUES ($1, $2)
              RETURNING *`,
             [name, payment_methods || 'paypal']
@@ -2626,7 +2982,7 @@ const getCountryById = async (req, res, next) => {
         const { id } = req.params;
         const result = await query(
             `SELECT id, name, payment_methods, created_at, updated_at
-             FROM countries_list WHERE id = $1`,
+             FROM countries WHERE id = $1`,
             [id]
         );
         if (result.rows.length === 0) {
@@ -2653,7 +3009,7 @@ const updateCountry = async (req, res, next) => {
         }
 
         const result = await query(
-            `UPDATE countries_list 
+            `UPDATE countries 
              SET name = $1, payment_methods = $2, updated_at = CURRENT_TIMESTAMP
              WHERE id = $3
              RETURNING *`,
@@ -2682,7 +3038,7 @@ const deleteCountry = async (req, res, next) => {
     try {
         const { id } = req.params;
         const result = await query(
-            `DELETE FROM countries_list WHERE id = $1 RETURNING id`,
+            `DELETE FROM countries WHERE id = $1 RETURNING id`,
             [id]
         );
 
@@ -2734,16 +3090,40 @@ const getBloggerStats = async (req, res, next) => {
             SELECT 
                 u.id, u.name, u.email, u.status as is_active, 
                 u.last_login, u.login_count, u.created_at,
-                COALESCE(w.balance, 0) as wallet_balance,
+                COALESCE(
+                    (SELECT SUM(
+                        COALESCE(
+                            NULLIF(nopd.price, 0), 
+                            CASE WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION ELSE NULL END,
+                            CASE WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION ELSE NULL END,
+                            0
+                        )
+                    )
+                     FROM new_order_process_details nopd
+                     JOIN new_sites ns ON nopd.new_site_id = ns.id
+                     WHERE nopd.vendor_id = u.id 
+                       AND nopd.status = 8
+                       AND nopd.id NOT IN (
+                           SELECT wh.order_detail_id 
+                           FROM wallet_histories wh
+                           JOIN withdraw_requests wr ON wh.withdraw_request_id = wr.id
+                           WHERE wr.status = 1
+                             AND wh.order_detail_id IS NOT NULL
+                       )
+                       AND nopd.id NOT IN (
+                           SELECT wh2.order_detail_id
+                           FROM wallet_histories wh2
+                           WHERE wh2.approved_date IS NOT NULL
+                             AND wh2.order_detail_id IS NOT NULL
+                       )), 
+                    0
+                ) as wallet_balance,
                 (SELECT COUNT(*) FROM new_order_process_details nopd 
-                 JOIN new_sites ns ON nopd.new_site_id = ns.id 
-                 WHERE ns.uploaded_user_id = u.id) as total_orders,
+                 WHERE nopd.vendor_id = u.id) as total_orders,
                 (SELECT COUNT(*) FROM new_order_process_details nopd 
-                 JOIN new_sites ns ON nopd.new_site_id = ns.id 
-                 WHERE ns.uploaded_user_id = u.id AND nopd.status IN (5, 6, 7)) as pending_orders,
+                 WHERE nopd.vendor_id = u.id AND nopd.status IN (5, 6, 7)) as pending_orders,
                 (SELECT COUNT(*) FROM new_order_process_details nopd 
-                 JOIN new_sites ns ON nopd.new_site_id = ns.id 
-                 WHERE ns.uploaded_user_id = u.id AND nopd.status = 8) as completed_orders
+                 WHERE nopd.vendor_id = u.id AND nopd.status = 8) as completed_orders
             FROM users u
             LEFT JOIN wallets w ON u.id = w.user_id
             ${whereClause}
@@ -2787,7 +3167,7 @@ const getInvoiceDetail = async (req, res, next) => {
                 cl.name as country_name
              FROM withdraw_requests wr
              JOIN users u ON wr.user_id = u.id
-             LEFT JOIN countries_list cl ON u.country_id = cl.id
+             LEFT JOIN countries cl ON u.country_id = cl.id
              WHERE wr.id = $1`,
             [id]
         );
@@ -2812,6 +3192,7 @@ const getInvoiceDetail = async (req, res, next) => {
                     WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION
                     ELSE 0
                 END as price,
+                wh.remarks,
                 nopd.submit_url,
                 ns.root_domain,
                 no.order_id as manual_order_id
@@ -2835,10 +3216,18 @@ const getInvoiceDetail = async (req, res, next) => {
             return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
         };
 
+        // Extract the invoice note from the withdrawal request remarks.
+        // All items in the same withdrawal request share the same remark, so we can just grab the first non-empty one.
+        let invoiceNote = 'Thank you for your business!';
+        const validRemarkObj = itemsResult.rows.find(row => row.remarks && row.remarks.trim() !== '');
+        if (validRemarkObj) {
+            invoiceNote = validRemarkObj.remarks.trim();
+        }
+
         // Format response for frontend AdminInvoiceDetail.jsx
         res.json({
             invoice: {
-                number: wr.invoice_pre ? `${wr.invoice_pre}${wr.invoice_number}` : (wr.invoice_number || wr.id),
+                number: wr.invoice_pre ? `${wr.invoice_pre}${wr.invoice_number}` : (wr.invoice_number || (100000 + parseInt(wr.id))),
                 date: formatDate(wr.created_at),
                 paidDate: wr.status === 1 ? formatDate(wr.updated_at) : null,
                 status: wr.status,
@@ -2862,7 +3251,7 @@ const getInvoiceDetail = async (req, res, next) => {
                 amount: `$${parseFloat(row.price || 0).toFixed(2)}`
             })),
             total: `$${totalAmount.toFixed(2)}`,
-            note: 'Thank you for your business!'
+            note: invoiceNote
         });
     } catch (error) {
         next(error);
@@ -2884,7 +3273,7 @@ const downloadInvoicePdf = async (req, res, next) => {
                     u.name, u.email, u.whatsapp as phone, cl.name as country_name
              FROM withdraw_requests wr
              JOIN users u ON wr.user_id = u.id
-             LEFT JOIN countries_list cl ON u.country_id = cl.id
+             LEFT JOIN countries cl ON u.country_id = cl.id
              WHERE wr.id = $1`,
             [id]
         );
@@ -2913,7 +3302,7 @@ const downloadInvoicePdf = async (req, res, next) => {
         );
 
         const totalAmount = itemsResult.rows.reduce((sum, row) => sum + parseFloat(row.price || 0), 0);
-        const invNum = wr.invoice_pre ? `${wr.invoice_pre}${wr.invoice_number}` : (wr.invoice_number || id);
+        const invNum = wr.invoice_pre ? `${wr.invoice_pre}${wr.invoice_number}` : (wr.invoice_number || (100000 + parseInt(id)));
 
         // Create PDF
         const doc = new PDFDocument({ margin: 50 });
@@ -3005,9 +3394,8 @@ const resetUserPassword = async (req, res, next) => {
             return res.status(404).json({ message: 'User not found' });
         }
 
-        // Generate random password
-        const crypto = require('crypto');
-        const newPassword = crypto.randomBytes(6).toString('hex'); // 12 char random password
+        // Generate standard default password
+        const newPassword = '12345678'; // 8 char default password
 
         // Hash password
         const hashedPassword = await bcrypt.hash(newPassword, 10);
@@ -3065,7 +3453,7 @@ const getUserPermissions = async (req, res, next) => {
         const { id } = req.params;
 
         const userResult = await query(
-            'SELECT id, name, email, role, status as is_active FROM users WHERE id = $1',
+            'SELECT id, name, email, role, status as is_active, permissions as ui_permissions FROM users WHERE id = $1',
             [id]
         );
 
@@ -3074,6 +3462,11 @@ const getUserPermissions = async (req, res, next) => {
         }
 
         const user = userResult.rows[0];
+
+        // Parse JSONB permissions or default to empty object
+        const dynamicPermissions = typeof user.ui_permissions === 'string'
+            ? JSON.parse(user.ui_permissions || '{}')
+            : (user.ui_permissions || {});
 
         res.json({
             user: {
@@ -3084,12 +3477,15 @@ const getUserPermissions = async (req, res, next) => {
                 is_active: user.is_active
             },
             permissions: {
+                // Static role-based capabilities
                 role: user.role,
                 canManageOrders: ['Admin', 'Manager', 'Team'].includes(user.role),
                 canManageSites: ['Admin', 'Manager'].includes(user.role),
                 canManageUsers: ['Admin'].includes(user.role),
                 canViewReports: ['Admin', 'Manager'].includes(user.role),
-                canManageWallet: ['Admin'].includes(user.role)
+                canManageWallet: ['Admin'].includes(user.role),
+                // Merge in the dynamic UI dashboard permissions
+                ...dynamicPermissions
             }
         });
     } catch (error) {
@@ -3107,25 +3503,61 @@ const updateUserPermissions = async (req, res, next) => {
         const { id } = req.params;
         const { permissions } = req.body;
 
-        if (!permissions || !permissions.role) {
-            return res.status(400).json({ message: 'Role is required in permissions' });
-        }
-
-        const validRoles = ['Admin', 'Manager', 'Team', 'Writer', 'Blogger'];
-        if (!validRoles.includes(permissions.role)) {
-            return res.status(400).json({ message: `Invalid role. Must be one of: ${validRoles.join(', ')}` });
+        if (!permissions) {
+            return res.status(400).json({ message: 'Permissions payload is required' });
         }
 
         // Check user exists
-        const userResult = await query('SELECT id FROM users WHERE id = $1', [id]);
+        const userResult = await query('SELECT id, permissions as current_permissions FROM users WHERE id = $1', [id]);
         if (userResult.rows.length === 0) {
             return res.status(404).json({ message: 'User not found' });
         }
 
-        // Update role
+        const currentUserPermissions = typeof userResult.rows[0].current_permissions === 'string'
+            ? JSON.parse(userResult.rows[0].current_permissions || '{}')
+            : (userResult.rows[0].current_permissions || {});
+
+        // If the payload includes a role, attempt to update it
+        if (permissions.role) {
+            const incomingRole = String(permissions.role).trim().toLowerCase();
+            const validRolesMap = {
+                'admin': 'admin',
+                'manager': 'manager',
+                'team': 'team',
+                'team member': 'team',
+                'writer': 'writer',
+                'blogger': 'vendor',
+                'accountant': 'accountant'
+            };
+
+            if (validRolesMap[incomingRole]) {
+                await query(
+                    'UPDATE users SET role = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+                    [validRolesMap[incomingRole], id]
+                );
+            } else {
+                // If it's totally invalid, we can just optionally ignore the role update part 
+                // and proceed with permissions, or strictly fail. Let's strictly fail with a better message.
+                return res.status(400).json({ message: `Invalid role provided: ${permissions.role}. System expected one of: Admin, Manager, Team, Writer, Blogger` });
+            }
+        }
+
+        // Extract UI boolean flags from the incoming payload (ignoring static role capabilities)
+        const uiFlags = { ...permissions };
+        delete uiFlags.role;
+        delete uiFlags.canManageOrders;
+        delete uiFlags.canManageSites;
+        delete uiFlags.canManageUsers;
+        delete uiFlags.canViewReports;
+        delete uiFlags.canManageWallet;
+
+        // Merge the incoming UI flags with whatever may already exist in the DB
+        const mergedPermissions = { ...currentUserPermissions, ...uiFlags };
+
+        // Save dynamic permissions back to database
         await query(
-            'UPDATE users SET role = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-            [permissions.role, id]
+            'UPDATE users SET permissions = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+            [JSON.stringify(mergedPermissions), id]
         );
 
         res.json({ message: 'Permissions updated successfully' });
@@ -3145,10 +3577,37 @@ const getBloggerPerformance = async (req, res, next) => {
     try {
         const { id } = req.params;
 
-        // Get blogger info
+        // Get blogger info with accurate calculated wallet balance matching getBloggerStats
         const userResult = await query(
-            `SELECT id, name, email, status as is_active, created_at,
-                    COALESCE((SELECT balance FROM wallets WHERE user_id = users.id), 0) as wallet_balance
+            `SELECT id, name, email, status as is_active, created_at, last_login, login_count,
+                 COALESCE(
+                    (SELECT SUM(
+                        COALESCE(
+                            NULLIF(nopd.price, 0), 
+                            CASE WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION ELSE NULL END,
+                            CASE WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION ELSE NULL END,
+                            0
+                        )
+                    )
+                     FROM new_order_process_details nopd
+                     JOIN new_sites ns ON nopd.new_site_id = ns.id
+                     WHERE nopd.vendor_id = users.id 
+                       AND nopd.status = 8
+                       AND nopd.id NOT IN (
+                           SELECT wh.order_detail_id 
+                           FROM wallet_histories wh
+                           JOIN withdraw_requests wr ON wh.withdraw_request_id = wr.id
+                           WHERE wr.status = 1
+                             AND wh.order_detail_id IS NOT NULL
+                       )
+                       AND nopd.id NOT IN (
+                           SELECT wh2.order_detail_id
+                           FROM wallet_histories wh2
+                           WHERE wh2.approved_date IS NOT NULL
+                             AND wh2.order_detail_id IS NOT NULL
+                       )), 
+                    0
+                ) as wallet_balance
              FROM users WHERE id = $1`,
             [id]
         );
@@ -3167,15 +3626,16 @@ const getBloggerPerformance = async (req, res, next) => {
                 COUNT(*) FILTER (WHERE nopd.status = 8) as completed_orders,
                 COUNT(*) FILTER (WHERE nopd.status IN (9, 10)) as rejected_orders,
                 COALESCE(SUM(
-                    CASE 
-                        WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION
-                        WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION
-                        ELSE 0
-                    END
+                    COALESCE(
+                        NULLIF(nopd.price, 0), 
+                        CASE WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION ELSE NULL END,
+                        CASE WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION ELSE NULL END,
+                        0
+                    )
                 ) FILTER (WHERE nopd.status = 8), 0) as total_earnings
             FROM new_order_process_details nopd
             JOIN new_sites ns ON nopd.new_site_id = ns.id
-            WHERE ns.uploaded_user_id = $1
+            WHERE nopd.vendor_id = $1
         `, [id]);
 
         // Get websites count
@@ -3184,35 +3644,131 @@ const getBloggerPerformance = async (req, res, next) => {
             [id]
         );
 
-        // Get recent orders
+        // Get recent orders using vendor_id for correct assignment
         const recentOrdersResult = await query(`
             SELECT nopd.id, nopd.status, nopd.created_at, nopd.submit_url,
                    ns.root_domain,
-                   CASE 
-                       WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION
-                       WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION
-                       ELSE 0
-                   END as price
+                   COALESCE(NULLIF(nopd.price, 0),
+                       CASE WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION ELSE NULL END,
+                       CASE WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION ELSE NULL END,
+                       0
+                   ) as price
             FROM new_order_process_details nopd
             JOIN new_sites ns ON nopd.new_site_id = ns.id
-            WHERE ns.uploaded_user_id = $1
+            WHERE nopd.vendor_id = $1
             ORDER BY nopd.created_at DESC
             LIMIT 10
         `, [id]);
 
         const stats = statsResult.rows[0] || {};
 
+        // Merge stats into blogger so frontend reads response.blogger.total_orders etc.
+        const mergedBlogger = {
+            ...blogger,
+            total_orders: parseInt(stats.total_orders) || 0,
+            pending_orders: parseInt(stats.pending_orders) || 0,
+            completed_orders: parseInt(stats.completed_orders) || 0,
+            rejected_orders: parseInt(stats.rejected_orders) || 0,
+            total_earnings: parseFloat(stats.total_earnings) || 0,
+            total_websites: parseInt(websitesResult.rows[0]?.total) || 0,
+            wallet_balance: parseFloat(blogger.wallet_balance) || 0
+        };
+
         res.json({
-            blogger,
-            stats: {
-                total_orders: parseInt(stats.total_orders) || 0,
-                pending_orders: parseInt(stats.pending_orders) || 0,
-                completed_orders: parseInt(stats.completed_orders) || 0,
-                rejected_orders: parseInt(stats.rejected_orders) || 0,
-                total_earnings: parseFloat(stats.total_earnings) || 0,
-                total_websites: parseInt(websitesResult.rows[0]?.total) || 0
-            },
+            blogger: mergedBlogger,
             recentOrders: recentOrdersResult.rows
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   GET /api/admin/profile
+ * @desc    Get current admin's profile
+ * @access  Admin only
+ */
+const getProfile = async (req, res, next) => {
+    try {
+        const result = await query(
+            `SELECT id, name, email, gender, mobile_number, profile_image, created_at
+             FROM users WHERE id = $1`,
+            [req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                error: 'Not Found',
+                message: 'User not found'
+            });
+        }
+
+        const user = result.rows[0];
+        res.json({
+            id: user.id,
+            name: user.name,
+            email: user.email,
+            gender: user.gender || '',
+            mobile: user.mobile_number || '',
+            profile_image: user.profile_image || '',
+            created_at: user.created_at
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   PUT /api/admin/profile
+ * @desc    Update current admin's profile
+ * @access  Admin only
+ */
+const updateProfile = async (req, res, next) => {
+    try {
+        const { name, gender, mobile } = req.body;
+
+        if (!name || !name.trim()) {
+            return res.status(400).json({
+                error: 'Validation Error',
+                message: 'Name is required'
+            });
+        }
+
+        await query(
+            `UPDATE users SET name = $1, gender = $2, mobile_number = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4`,
+            [name.trim(), gender || null, mobile || null, req.user.id]
+        );
+
+        res.json({ message: 'Profile updated successfully' });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   POST /api/admin/profile/image
+ * @desc    Upload admin profile image
+ * @access  Admin only
+ */
+const uploadProfileImage = async (req, res, next) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({
+                error: 'Validation Error',
+                message: 'No image file provided'
+            });
+        }
+
+        const imagePath = `/uploads/profiles/${req.file.filename}`;
+
+        await query(
+            `UPDATE users SET profile_image = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+            [imagePath, req.user.id]
+        );
+
+        res.json({
+            message: 'Profile image uploaded successfully',
+            profile_image: imagePath
         });
     } catch (error) {
         next(error);
@@ -3230,7 +3786,7 @@ module.exports = {
     uploadWebsitesCSV,
     upload,
     updateWebsite,
-    deleteWebsite,
+    // deleteWebsite, // The original deleteWebsite is likely a hard delete, replacing with soft delete
     getStatistics,
     getAllTasks,
     getAllWithdrawals,
@@ -3253,13 +3809,17 @@ module.exports = {
     // Create Account From Sites
     getSitesForAccountCreation,
     createAccountsFromSites,
+    getWebsitesList,
+    getDeletedWebsitesList,
+    deleteWebsite, // This is now the soft delete
+    restoreWebsite,
     // Pending Bulk Requests
     getPendingBulkRequests,
     downloadBulkFile,
     acceptBulkRequest,
     rejectBulkRequest,
     // Sites List (same as manager)
-    getWebsitesList,
+    // getWebsitesList, // Already listed above
     // Bloggers Stats
     getBloggerStats,
     // Careers Management
@@ -3294,7 +3854,12 @@ module.exports = {
     changeUserPassword,
     getUserPermissions,
     updateUserPermissions,
+    impersonateUser,
     // Blogger Performance
-    getBloggerPerformance
+    getBloggerPerformance,
+    // Profile Management
+    getProfile,
+    updateProfile,
+    uploadProfileImage
 };
 

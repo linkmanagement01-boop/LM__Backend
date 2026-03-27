@@ -92,7 +92,8 @@ class Task {
                 w.name as writer_name,
                 w.email as writer_email,
                 nopd.vendor_id as assigned_blogger_id,
-                v.name as blogger_name
+                v.name as blogger_name,
+                nopd.reject_reason as rejection_reason
             FROM new_orders o
             LEFT JOIN users m ON o.manager_id = m.id
             LEFT JOIN users t ON o.team_id = t.id
@@ -104,7 +105,7 @@ class Task {
             ) nop ON true
             LEFT JOIN users w ON nop.writer_id = w.id
             LEFT JOIN LATERAL (
-                SELECT vendor_id 
+                SELECT vendor_id, reject_reason
                 FROM new_order_process_details 
                 WHERE new_order_process_id = nop.id 
                 ORDER BY id DESC LIMIT 1
@@ -176,6 +177,7 @@ class Task {
             team_name: row.team_name,
             writer_name: row.writer_name,
             blogger_name: row.blogger_name,
+            rejection_reason: row.rejection_reason,
             current_status: this.mapStatus(row.process_status || row.new_order_status, row.assigned_writer_id, row.assigned_blogger_id),
             created_at: row.created_at,
             updated_at: row.updated_at
@@ -264,7 +266,8 @@ class Task {
             writer_note: row.note,
             option_type: row.type || 'insert', // Map DB 'type' to 'option_type'
             replace_with: row.insert_after,    // Reuse column for replace_with
-            replace_statement: row.statement   // Reuse column for replace_statement
+            replace_statement: row.statement,   // Reuse column for replace_statement
+            is_rejected: Number(row.status) === 11 // Pass the rejected status natively, type-safe
         }));
 
         return {

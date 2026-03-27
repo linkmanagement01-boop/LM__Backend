@@ -73,7 +73,9 @@ const getMyTasks = async (req, res, next) => {
              JOIN new_orders no ON nop.new_order_id = no.id
              LEFT JOIN users m ON no.manager_id = m.id
              WHERE nopd.vendor_id = $1
-             ORDER BY nopd.new_site_id, nop.new_order_id, COALESCE(nopd.created_at, no.created_at) DESC NULLS LAST`,
+               AND nopd.status != 12
+               AND NOT (nopd.status = 7 AND (nopd.submit_url IS NULL OR nopd.submit_url = ''))
+             ORDER BY nopd.new_site_id, nop.new_order_id, COALESCE(nopd.created_at, no.created_at) DESC NULLS LAST, nopd.id DESC`,
             [bloggerId]
         );
 
@@ -108,7 +110,6 @@ const getMyTasks = async (req, res, next) => {
             upload_doc_file: row.upload_doc_file,
 
             // Order info
-            client_name: row.client_name,
             order_type: row.order_type,
             category: row.category,
             manager_name: row.manager_name,
@@ -122,7 +123,9 @@ const getMyTasks = async (req, res, next) => {
             current_status: (() => {
                 const status = row.detail_status;
                 if (status === 8) return 'completed';
-                if (status === 11 || status === 12) return 'rejected';
+                // Status 11 = manager rejected (blogger needs to resubmit)
+                if (status === 11) return 'rejected';
+                
                 if (status === 7 || row.submit_url) return 'waiting';
                 return 'pending'; // status 5 or assigned but not submitted
             })(),
@@ -184,6 +187,9 @@ const getTaskById = async (req, res, next) => {
  * Updates submit_url and status to 7 (pending manager verification)
  */
 const submitLiveLink = async (req, res, next) => {
+    const axios = require('axios');
+    const cheerio = require('cheerio');
+
     try {
         const { id } = req.params; // This is detail_id
         const { live_url } = req.body;
@@ -198,8 +204,9 @@ const submitLiveLink = async (req, res, next) => {
         }
 
         // Basic URL validation
+        let parsedUrl;
         try {
-            new URL(live_url);
+            parsedUrl = new URL(live_url);
         } catch (e) {
             return res.status(400).json({
                 error: 'Validation Error',
@@ -207,12 +214,16 @@ const submitLiveLink = async (req, res, next) => {
             });
         }
 
-        // Verify the detail belongs to this blogger
+        // Verify the detail belongs to this blogger and get order context
         const detailCheck = await query(
             `SELECT nopd.id, nopd.vendor_id, nopd.status, nopd.price,
-                    ns.root_domain, ns.niche_edit_price, ns.gp_price
+                    nopd.anchor, nopd.url as target_url,
+                    ns.root_domain, ns.niche_edit_price, ns.gp_price,
+                    no.client_website
              FROM new_order_process_details nopd
              JOIN new_sites ns ON nopd.new_site_id = ns.id
+             JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+             JOIN new_orders no ON nop.new_order_id = no.id
              WHERE nopd.id = $1`,
             [id]
         );
@@ -234,19 +245,122 @@ const submitLiveLink = async (req, res, next) => {
             });
         }
 
-        // Update the detail with submitted URL and status 7 (submitted to manager)
+        // ── STEP 1: Domain Matching Validation ──
+        const siteRootDomain = (detail.root_domain || '').toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '').replace(/^www\./, '');
+        const submittedDomain = parsedUrl.hostname.toLowerCase().replace(/^www\./, '');
+
+        if (!submittedDomain.includes(siteRootDomain) && !siteRootDomain.includes(submittedDomain)) {
+            return res.status(400).json({
+                error: 'Domain Mismatch',
+                message: `The submitted URL domain (${submittedDomain}) does not match the required website (${siteRootDomain}). Please submit a URL from the correct website.`
+            });
+        }
+
+        // ── STEP 2: Save URL immediately so it appears on manager's pending page ──
+        // Clear reject_reason on resubmit so manager sees a clean submission
+        console.log(`[submitLiveLink] Saving submit_url for detail ${id}: ${live_url}`);
         await query(
             `UPDATE new_order_process_details 
-             SET submit_url = $1, status = 7, updated_at = CURRENT_TIMESTAMP
+             SET submit_url = $1, status = 7, reject_reason = NULL,
+                 link_status = 'Pending', link_check_result = 'Verification in progress',
+                 updated_at = CURRENT_TIMESTAMP
              WHERE id = $2`,
             [live_url, id]
         );
 
+        // Send success response immediately — don't make the blogger wait for scraping
         res.json({
-            message: 'Live URL submitted successfully! Waiting for manager verification.',
+            message: 'Live URL submitted successfully! Waiting for manager approval.',
             detail_id: id,
             root_domain: detail.root_domain,
-            submit_url: live_url
+            submit_url: live_url,
+            link_status: 'Pending',
+            link_check_result: 'Verification in progress'
+        });
+
+        // ── STEP 3: Background link verification (non-blocking) ──
+        // Run scraping AFTER the response is sent so it doesn't block the blogger
+        const clientWebsite = detail.client_website || detail.target_url || '';
+        const anchorText = detail.anchor || '';
+
+        setImmediate(async () => {
+            let linkStatus = 'Not Found';
+            let checkResult = '';
+
+            try {
+                const response = await axios.get(live_url, {
+                    timeout: 15000,
+                    maxRedirects: 5,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Accept': 'text/html,application/xhtml+xml'
+                    },
+                    validateStatus: (status) => status >= 200 && status < 500
+                });
+
+                if (response.status === 404) {
+                    linkStatus = 'Unverified';
+                    checkResult = 'Page returned 404 - Not Found';
+                } else if (response.status !== 200) {
+                    linkStatus = 'Unverified';
+                    checkResult = `Page returned HTTP ${response.status}`;
+                } else {
+                    const $ = cheerio.load(response.data);
+                    let cleanClient = clientWebsite.toLowerCase().replace(/\/$/, '');
+                    const clientDomain = cleanClient.replace(/^https?:\/\//, '');
+
+                    let found = false;
+                    $('a').each((i, el) => {
+                        let href = $(el).attr('href');
+                        const text = $(el).text().trim();
+                        const rel = $(el).attr('rel') || '';
+                        if (!href) return;
+
+                        let cleanHref = href.toLowerCase().replace(/\/$/, '');
+                        const hrefDomain = cleanHref.replace(/^https?:\/\//, '');
+
+                        if (hrefDomain.includes(clientDomain) || cleanHref.includes(clientDomain)) {
+                            found = true;
+                            if (anchorText && anchorText.trim() !== '') {
+                                if (text.toLowerCase().includes(anchorText.toLowerCase()) ||
+                                    anchorText.toLowerCase().includes(text.toLowerCase())) {
+                                    linkStatus = 'Live';
+                                    checkResult = `Live - ${rel.includes('nofollow') ? 'Nofollow' : 'Dofollow'}`;
+                                } else {
+                                    linkStatus = 'Issue';
+                                    checkResult = 'Anchor Mismatch';
+                                }
+                            } else {
+                                linkStatus = 'Live';
+                                checkResult = `Live - ${rel.includes('nofollow') ? 'Nofollow' : 'Dofollow'}`;
+                            }
+                            return false;
+                        }
+                    });
+
+                    if (!found) {
+                        linkStatus = 'Not Found';
+                        checkResult = 'Link not found on page';
+                    }
+                }
+            } catch (scrapeError) {
+                linkStatus = 'Error';
+                checkResult = scrapeError.code || 'Network Error';
+            }
+
+            // Update verification results in background
+            try {
+                await query(
+                    `UPDATE new_order_process_details 
+                     SET link_status = $1, link_check_result = $2,
+                         last_checked_at = NOW()
+                     WHERE id = $3`,
+                    [linkStatus, checkResult, id]
+                );
+                console.log(`[submitLiveLink] Background verification for detail ${id}: ${linkStatus} - ${checkResult}`);
+            } catch (bgError) {
+                console.error(`[submitLiveLink] Background verification DB update failed for detail ${id}:`, bgError.message);
+            }
         });
     } catch (error) {
         next(error);
@@ -385,19 +499,39 @@ const getInvoices = async (req, res, next) => {
         );
         const total = parseInt(countResult.rows[0]?.total || 0);
 
-        // Get withdraw requests with aggregated amount from wallet_histories
-        // wallet_histories has withdraw_request_id that links to withdraw_requests.id
+        // Get withdraw requests with aggregated amount and payment details from wallet_histories
         const invoicesResult = await query(
             `SELECT 
                 wr.id,
-                CONCAT(wr.invoice_pre, '-', wr.invoice_number) as invoice_number,
+                wr.invoice_pre,
+                wr.invoice_number,
                 wr.invoice_file,
                 wr.status,
                 wr.created_at,
                 wr.updated_at,
-                COALESCE(SUM(wh.price), 0) as amount
+                COALESCE(SUM(
+                    CASE 
+                        WHEN wh.price > 0 THEN wh.price
+                        WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION
+                        WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION
+                        ELSE 0
+                    END
+                ), 0) as amount,
+                MAX(wh.payment_method) as payment_method,
+                MAX(wh.paypal_email) as paypal_email,
+                MAX(wh.bank_type) as bank_type,
+                MAX(wh.account_number) as account_number,
+                MAX(wh.beneficiary_name) as beneficiary_name,
+                MAX(wh.ifsc_code) as ifsc_code,
+                MAX(wh.bene_bank_name) as bene_bank_name,
+                MAX(wh.approved_date) as approved_date,
+                MAX(no.order_id) as order_id
              FROM withdraw_requests wr
              LEFT JOIN wallet_histories wh ON wh.withdraw_request_id = wr.id
+             LEFT JOIN new_order_process_details nopd ON wh.order_detail_id = nopd.id
+             LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
+             LEFT JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+             LEFT JOIN new_orders no ON nop.new_order_id = no.id
              WHERE wr.user_id = $1
              GROUP BY wr.id, wr.invoice_pre, wr.invoice_number, wr.invoice_file, wr.status, wr.created_at, wr.updated_at
              ORDER BY wr.created_at DESC
@@ -415,14 +549,28 @@ const getInvoices = async (req, res, next) => {
 
         const invoices = invoicesResult.rows.map(row => ({
             id: row.id,
-            invoice_number: row.invoice_number,
+            invoice_number: row.invoice_pre ? `${row.invoice_pre}${row.invoice_number}` : (row.invoice_number || (100000 + parseInt(row.id))),
             invoice_file: row.invoice_file,
             type: 'withdrawal',
             amount: parseFloat(row.amount) || 0,
             status: row.status,
             status_text: statusMap[row.status] || 'Unknown',
             created_at: row.created_at,
-            updated_at: row.updated_at
+            updated_at: row.updated_at,
+            // Payment method info
+            payment_method: row.payment_method || null,
+            paypal_email: row.paypal_email || null,
+            bank_details: (row.bank_type || row.account_number || row.beneficiary_name || row.ifsc_code) ? {
+                bank_type: row.bank_type || null,
+                account_number: row.account_number || null,
+                beneficiary_name: row.beneficiary_name || null,
+                ifsc_code: row.ifsc_code || null,
+                bank_name: row.bene_bank_name || null
+            } : null,
+            // Paid/approved date
+            paid_date: row.status === 1 ? (row.approved_date || row.updated_at) : null,
+            // Order info
+            order_id: row.order_id || null
         }));
 
         res.json({
@@ -833,7 +981,7 @@ const getPaymentDetails = async (req, res, next) => {
                 cl.name as country_name,
                 cl.payment_methods
              FROM users u
-             LEFT JOIN countries_list cl ON u.country_id = cl.id
+             LEFT JOIN countries cl ON u.country_id = cl.id
              WHERE u.id = $1`,
             [req.user.id]
         );
@@ -847,11 +995,20 @@ const getPaymentDetails = async (req, res, next) => {
 
         const user = result.rows[0];
 
-        // Parse payment_methods from country (stored as comma-separated string: 'bank, qr_code, upi_id')
+        // Parse payment_methods from country (stored as JSON array string: '["bank","qr_code","upi_id","paypal"]')
         let availableMethods = ['paypal'];
         if (user.payment_methods) {
-            // Split by comma and trim whitespace
-            availableMethods = user.payment_methods.split(',').map(m => m.trim()).filter(m => m);
+            try {
+                // Try parsing as JSON first
+                availableMethods = JSON.parse(user.payment_methods);
+            } catch (e) {
+                // Fallback: Split by comma and clean up quotes/brackets if it was malformed
+                availableMethods = user.payment_methods
+                    .replace(/[\[\]"]/g, '')
+                    .split(',')
+                    .map(m => m.trim())
+                    .filter(m => m);
+            }
         }
 
         res.json({
@@ -992,15 +1149,15 @@ const getWithdrawableOrders = async (req, res, next) => {
              WHERE nopd.vendor_id = $1 
                AND nopd.status = 8
                AND nopd.id NOT IN (
-                   -- Exclude orders that are in any NON-REJECTED withdrawal request (Pending, Approved, Processing)
+                   -- Exclude orders linked to a Pending or Approved withdrawal request (covers both legacy credit & modern debit entries)
                    SELECT wh.order_detail_id 
                    FROM wallet_histories wh
                    JOIN withdraw_requests wr ON wh.withdraw_request_id = wr.id
-                   WHERE wr.status IN (0, 1, 2) -- 0=Pending, 1=Approved, 2=Processing
+                   WHERE wr.status IN (0, 1)  -- 0=Pending, 1=Approved
                      AND wh.order_detail_id IS NOT NULL
                )
                AND nopd.id NOT IN (
-                   -- Also exclude orders with approved_date set
+                   -- Also exclude orders whose wallet_history has been marked as approved/paid
                    SELECT wh2.order_detail_id
                    FROM wallet_histories wh2
                    WHERE wh2.approved_date IS NOT NULL
@@ -1051,12 +1208,46 @@ const submitWithdrawalRequest = async (req, res, next) => {
             });
         }
 
+        // Cast all order_ids to integers for consistent comparison
+        const intOrderIds = order_ids.map(id => parseInt(id, 10)).filter(id => !isNaN(id));
+
+        // Filter out orders that already have ANY wallet_history entry linked to an approved/pending withdrawal
+        // Covers both legacy (credit with withdraw_request_id) and modern (debit entries) structures
+        const alreadyWithdrawnResult = await query(
+            `SELECT DISTINCT wh.order_detail_id 
+             FROM wallet_histories wh
+             WHERE wh.order_detail_id = ANY($1::int[]) 
+               AND wh.order_detail_id IS NOT NULL
+               AND (
+                   -- Modern debit entries
+                   wh.type = 'debit'
+                   -- Legacy: credit entries linked to an approved/pending withdrawal request
+                   OR wh.withdraw_request_id IN (
+                       SELECT wr.id FROM withdraw_requests wr WHERE wr.status IN (0, 1)
+                   )
+                   -- Or entries already marked as paid
+                   OR wh.approved_date IS NOT NULL
+               )`,
+            [intOrderIds]
+        );
+        const alreadyWithdrawnIds = new Set(alreadyWithdrawnResult.rows.map(r => parseInt(r.order_detail_id, 10)));
+        const validOrderIds = intOrderIds.filter(id => !alreadyWithdrawnIds.has(id));
+
+        console.log('[Withdrawal] order_ids:', intOrderIds, 'already_withdrawn:', [...alreadyWithdrawnIds], 'valid:', validOrderIds);
+
+        if (validOrderIds.length === 0) {
+            return res.status(400).json({
+                error: 'Validation Error',
+                message: 'All selected orders have already been submitted for withdrawal'
+            });
+        }
+
         // Get the orders and calculate total amount
         const ordersResult = await query(
             `SELECT nopd.id, nopd.price 
              FROM new_order_process_details nopd
-             WHERE nopd.id = ANY($1) AND nopd.vendor_id = $2 AND nopd.status = 8`,
-            [order_ids, bloggerId]
+             WHERE nopd.id = ANY($1::int[]) AND nopd.vendor_id = $2 AND nopd.status = 8`,
+            [validOrderIds, bloggerId]
         );
 
         if (ordersResult.rows.length === 0) {
@@ -1098,41 +1289,56 @@ const submitWithdrawalRequest = async (req, res, next) => {
             [bloggerId]
         );
 
+        let walletId;
         if (walletResult.rows.length === 0) {
-            return res.status(400).json({
-                error: 'Error',
-                message: 'Wallet not found'
-            });
+            // Auto-create wallet for this blogger
+            const createWallet = await query(
+                'INSERT INTO wallets (user_id, balance, created_at) VALUES ($1, 0, CURRENT_TIMESTAMP) RETURNING id',
+                [bloggerId]
+            );
+            walletId = createWallet.rows[0].id;
+        } else {
+            walletId = walletResult.rows[0].id;
         }
 
-        const walletId = walletResult.rows[0].id;
 
         // Create wallet history entries for each order with payment details snapshot
-        for (const orderId of order_ids) {
-            const order = ordersResult.rows.find(r => r.id === orderId);
+        let insertedCount = 0;
+        for (const orderId of validOrderIds) {
+            const order = ordersResult.rows.find(r => parseInt(r.id, 10) === orderId);
             if (order) {
-                await query(
-                    `INSERT INTO wallet_histories (
-                        wallet_id, order_detail_id, type, price, status, 
-                        payment_method, withdraw_request_id, request_date, created_at,
-                        paypal_email, upi_id, qr_code_image,
-                        bank_type, beneficiary_account_number, beneficiary_name,
-                        bene_bank_name, ifsc_code, bene_bank_branch_name,
-                        beneficiary_email_id, customer_reference_number,
-                        ac_holder_name, bank_name, account_number, bank_address, swift_code
-                     )
-                     VALUES ($1, $2, 'debit', $3, 0, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
-                             $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
-                    [
-                        walletId, orderId, order.price, payment_method || 'paypal', withdrawRequestId,
-                        userDetails.paypal_email, userDetails.upi_id, userDetails.qr_code_image,
-                        userDetails.bank_type, userDetails.beneficiary_account_number, userDetails.beneficiary_name,
-                        userDetails.bene_bank_name, userDetails.ifsc_code, userDetails.bene_bank_branch_name,
-                        userDetails.beneficiary_email_id, userDetails.customer_reference_number,
-                        userDetails.ac_holder_name, userDetails.bank_name, userDetails.account_number,
-                        userDetails.bank_address, userDetails.swift_code
-                    ]
-                );
+                try {
+                    await query(
+                        `INSERT INTO wallet_histories (
+                            wallet_id, order_detail_id, type, price, status, 
+                            payment_method, withdraw_request_id, request_date, created_at,
+                            paypal_email, upi_id, qr_code_image,
+                            bank_type, beneficiary_account_number, beneficiary_name,
+                            bene_bank_name, ifsc_code, bene_bank_branch_name,
+                            beneficiary_email_id, customer_reference_number,
+                            ac_holder_name, bank_name, account_number, bank_address, swift_code
+                         )
+                         VALUES ($1, $2, 'debit', $3, 0, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+                                 $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
+                        [
+                            walletId, orderId, order.price, payment_method || 'paypal', withdrawRequestId,
+                            userDetails.paypal_email, userDetails.upi_id, userDetails.qr_code_image,
+                            userDetails.bank_type, userDetails.beneficiary_account_number, userDetails.beneficiary_name,
+                            userDetails.bene_bank_name, userDetails.ifsc_code, userDetails.bene_bank_branch_name,
+                            userDetails.beneficiary_email_id, userDetails.customer_reference_number,
+                            userDetails.ac_holder_name, userDetails.bank_name, userDetails.account_number,
+                            userDetails.bank_address, userDetails.swift_code
+                        ]
+                    );
+                    insertedCount++;
+                } catch (insertError) {
+                    // Skip duplicate entries gracefully (unique constraint violation)
+                    if (insertError.code === '23505') {
+                        console.warn(`[Withdrawal] Skipping duplicate wallet_history for order ${orderId}`);
+                        continue;
+                    }
+                    throw insertError; // Re-throw other errors
+                }
             }
         }
 
@@ -1140,7 +1346,7 @@ const submitWithdrawalRequest = async (req, res, next) => {
             message: 'Withdrawal request submitted successfully',
             withdraw_request_id: withdrawRequestId,
             total_amount: totalAmount,
-            orders_count: order_ids.length
+            orders_count: validOrderIds.length
         });
     } catch (error) {
         next(error);
@@ -1422,13 +1628,13 @@ const changePassword = async (req, res, next) => {
 
 /**
  * @route   GET /api/blogger/countries
- * @desc    Get list of available countries from admin's countries_list
+ * @desc    Get list of available countries from admin's countries
  * @access  Public (used in profile forms)
  */
 const getCountries = async (req, res, next) => {
     try {
         const result = await query(
-            'SELECT id, name, payment_methods FROM countries_list ORDER BY name ASC'
+            'SELECT id, name, payment_methods FROM countries ORDER BY name ASC'
         );
 
         res.json({
@@ -1606,7 +1812,7 @@ const getInvoiceDetail = async (req, res, next) => {
                 cl.name as country_name
              FROM withdraw_requests wr
              JOIN users u ON wr.user_id = u.id
-             LEFT JOIN countries_list cl ON u.country_id = cl.id
+             LEFT JOIN countries cl ON u.country_id = cl.id
              WHERE wr.id = $1 AND wr.user_id = $2`,
             [id, bloggerId]
         );
@@ -1656,7 +1862,7 @@ const getInvoiceDetail = async (req, res, next) => {
 
         res.json({
             invoice: {
-                number: wr.invoice_pre ? `${wr.invoice_pre}${wr.invoice_number}` : (wr.invoice_number || wr.id),
+                number: wr.invoice_pre ? `${wr.invoice_pre}${wr.invoice_number}` : (wr.invoice_number || (100000 + parseInt(wr.id))),
                 date: formatDate(wr.created_at),
                 paidDate: wr.status === 1 ? formatDate(wr.updated_at) : null,
                 status: wr.status,
@@ -1704,7 +1910,7 @@ const downloadInvoicePdf = async (req, res, next) => {
                     u.name, u.email, u.whatsapp as phone, cl.name as country_name
              FROM withdraw_requests wr
              JOIN users u ON wr.user_id = u.id
-             LEFT JOIN countries_list cl ON u.country_id = cl.id
+             LEFT JOIN countries cl ON u.country_id = cl.id
              WHERE wr.id = $1 AND wr.user_id = $2`,
             [id, bloggerId]
         );
@@ -1733,7 +1939,7 @@ const downloadInvoicePdf = async (req, res, next) => {
         );
 
         const totalAmount = itemsResult.rows.reduce((sum, row) => sum + parseFloat(row.price || 0), 0);
-        const invNum = wr.invoice_pre ? `${wr.invoice_pre}${wr.invoice_number}` : (wr.invoice_number || id);
+        const invNum = wr.invoice_pre ? `${wr.invoice_pre}${wr.invoice_number}` : (wr.invoice_number || (100000 + parseInt(id)));
 
         // Create PDF
         const doc = new PDFDocument({ margin: 50 });
@@ -1807,6 +2013,156 @@ const downloadInvoicePdf = async (req, res, next) => {
         }
     }
 };
+// ==================== LIVE LINK CHECKER ====================
+
+/**
+ * @route   POST /api/blogger/check-link
+ * @desc    Check if blogger's submitted URL contains the correct backlink & anchor
+ * @access  Blogger only
+ */
+const checkLinkStatus = async (req, res, next) => {
+    try {
+        const { detailId, bloggerLink, clientWebsite, anchorText } = req.body;
+        const bloggerId = req.user.id;
+
+        if (!bloggerLink) {
+            return res.status(400).json({ error: 'Blogger link is required' });
+        }
+
+        // Verify the detail belongs to this blogger
+        if (detailId) {
+            const ownerCheck = await query(
+                `SELECT vendor_id FROM new_order_process_details WHERE id = $1`,
+                [detailId]
+            );
+            if (ownerCheck.rows.length > 0 && String(ownerCheck.rows[0].vendor_id) !== String(bloggerId)) {
+                return res.status(403).json({ error: 'Not authorized to check this link' });
+            }
+        }
+
+        const axios = require('axios');
+        const cheerio = require('cheerio');
+
+        let linkStatus = 'Not Found';
+        let checkResult = '';
+
+        try {
+            const response = await axios.get(bloggerLink, {
+                timeout: 20000,
+                maxRedirects: 5,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5'
+                },
+                validateStatus: (status) => status >= 200 && status < 500
+            });
+
+            if (response.status === 404) {
+                linkStatus = 'Not Found';
+                checkResult = 'Page Not Found (404)';
+            } else if (response.status !== 200) {
+                linkStatus = 'Issue';
+                checkResult = `Issue! Status ${response.status}`;
+            } else if (clientWebsite) {
+                const $ = cheerio.load(response.data);
+                let cleanClientWebsite = clientWebsite.toLowerCase();
+                if (cleanClientWebsite.endsWith('/')) {
+                    cleanClientWebsite = cleanClientWebsite.slice(0, -1);
+                }
+                const clientDomain = cleanClientWebsite.replace(/^https?:\/\//, '');
+
+                let foundAnyLink = false;
+                let foundMatchingAnchor = false;
+                let bestMismatchText = null;
+                let finalRel = 'Dofollow';
+
+                $('a').each((i, el) => {
+                    const link = $(el);
+                    let href = link.attr('href');
+                    let text = link.text().trim();
+                    const rel = link.attr('rel') || '';
+
+                    if (!href) return;
+
+                    let cleanHref = href.toLowerCase();
+                    if (cleanHref.endsWith('/')) {
+                        cleanHref = cleanHref.slice(0, -1);
+                    }
+                    const hrefDomain = cleanHref.replace(/^https?:\/\//, '');
+
+                    if (hrefDomain.includes(clientDomain) || cleanHref.includes(clientDomain)) {
+                        foundAnyLink = true;
+
+                        if (!anchorText || anchorText.trim() === '') {
+                            foundMatchingAnchor = true;
+                            finalRel = rel;
+                            return false; // Found a valid link, no anchor needed
+                        } else {
+                            let expected = anchorText.toLowerCase().trim();
+                            let actual = text.toLowerCase();
+                            
+                            // Try img alt for empty links
+                            if (actual === '') {
+                                const imgAlt = link.find('img').attr('alt');
+                                if (imgAlt) actual = imgAlt.trim().toLowerCase();
+                            }
+
+                            // Strict validation (empty passes .includes otherwise)
+                            if (actual !== '' && (actual.includes(expected) || expected.includes(actual))) {
+                                foundMatchingAnchor = true;
+                                finalRel = rel;
+                                return false; // Perfect match, break out
+                            } else if (actual !== '') {
+                                if (!bestMismatchText) bestMismatchText = actual;
+                            }
+                        }
+                    }
+                });
+
+                if (foundMatchingAnchor) {
+                    linkStatus = 'Live';
+                    const classification = finalRel.includes('nofollow') ? 'Nofollow' : 'Dofollow';
+                    checkResult = `Live - ${classification}`;
+                } else if (foundAnyLink) {
+                    linkStatus = 'Issue';
+                    checkResult = `Anchor Mismatch (Expected: "${anchorText}", Found: "${bestMismatchText || 'Empty/Image Link'}")`;
+                } else {
+                    linkStatus = 'Not Found';
+                    checkResult = `Link to ${clientDomain} not found on page`;
+                }
+            } else {
+                // No client website to check against, just verify page loads
+                linkStatus = 'Live';
+                checkResult = 'Page loads OK (no target URL to verify)';
+            }
+
+        } catch (error) {
+            linkStatus = 'Error';
+            checkResult = error.code === 'ECONNREFUSED' ? 'Connection Refused' :
+                error.code === 'ETIMEDOUT' ? 'Request Timeout' :
+                    error.code === 'ENOTFOUND' ? 'Domain Not Found' :
+                        error.message || 'Scraping Error';
+        }
+
+        // Update DB if detailId provided
+        if (detailId) {
+            await query(
+                `UPDATE new_order_process_details SET link_status = $1, link_check_result = $2, last_checked_at = NOW() WHERE id = $3`,
+                [linkStatus, checkResult, detailId]
+            );
+        }
+
+        res.json({
+            status: linkStatus,
+            result: checkResult
+        });
+
+    } catch (error) {
+        console.error('Error checking link status:', error);
+        next(error);
+    }
+};
 
 module.exports = {
     getMyTasks,
@@ -1838,5 +2194,8 @@ module.exports = {
     getCountries,
     // Bulk Sites
     uploadBulkSitesFile,
-    getBulkUploadHistory
+    getBulkUploadHistory,
+    // Live Link Checker
+    checkLinkStatus
 };
+

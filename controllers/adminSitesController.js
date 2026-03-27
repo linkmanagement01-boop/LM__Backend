@@ -215,50 +215,61 @@ const checkLinkStatus = async (req, res, next) => {
                 console.log(`Searching for domain: ${clientDomain}`);
 
                 // Step 3: Search all anchor tags for link to client website
-                let found = false;
+                let foundAnyLink = false;
+                let foundMatchingAnchor = false;
+                let bestMismatchText = null;
+                let finalRel = 'Dofollow';
+
                 $('a').each((i, el) => {
                     const link = $(el);
                     let href = link.attr('href');
-                    const text = link.text().trim();
+                    let text = link.text().trim();
                     const rel = link.attr('rel') || '';
 
                     if (!href) return;
 
-                    // Normalize href for comparison
                     let cleanHref = href.toLowerCase();
                     if (cleanHref.endsWith('/')) {
                         cleanHref = cleanHref.slice(0, -1);
                     }
                     const hrefDomain = cleanHref.replace(/^https?:\/\//, '');
 
-                    // Check if href contains the client's domain
                     if (hrefDomain.includes(clientDomain) || cleanHref.includes(clientDomain)) {
-                        found = true;
-                        console.log(`Found link: href="${href}", text="${text}", rel="${rel}"`);
+                        foundAnyLink = true;
 
-                        // Check anchor text if provided
-                        if (anchorText && anchorText.trim() !== '') {
-                            if (text.toLowerCase().includes(anchorText.toLowerCase()) ||
-                                anchorText.toLowerCase().includes(text.toLowerCase())) {
-                                linkStatus = 'Live';
-                                linkClassification = rel.includes('nofollow') ? 'Nofollow' : 'Dofollow';
-                                checkResult = `Live - ${linkClassification}`;
-                            } else {
-                                linkStatus = 'Issue';
-                                linkClassification = 'Mismatch';
-                                checkResult = `Issue! Anchor Text (Expected: "${anchorText}", Found: "${text}")`;
-                            }
+                        if (!anchorText || anchorText.trim() === '') {
+                            foundMatchingAnchor = true;
+                            finalRel = rel;
+                            return false; 
                         } else {
-                            // No anchor text to check, just verify link exists
-                            linkStatus = 'Live';
-                            linkClassification = rel.includes('nofollow') ? 'Nofollow' : 'Dofollow';
-                            checkResult = `Live - ${linkClassification}`;
+                            let expected = anchorText.toLowerCase().trim();
+                            let actual = text.toLowerCase();
+                            
+                            if (actual === '') {
+                                const imgAlt = link.find('img').attr('alt');
+                                if (imgAlt) actual = imgAlt.trim().toLowerCase();
+                            }
+
+                            if (actual !== '' && (actual.includes(expected) || expected.includes(actual))) {
+                                foundMatchingAnchor = true;
+                                finalRel = rel;
+                                return false; 
+                            } else if (actual !== '') {
+                                if (!bestMismatchText) bestMismatchText = actual;
+                            }
                         }
-                        return false; // Break loop
                     }
                 });
 
-                if (!found) {
+                if (foundMatchingAnchor) {
+                    linkStatus = 'Live';
+                    linkClassification = finalRel.includes('nofollow') ? 'Nofollow' : 'Dofollow';
+                    checkResult = `Live - ${linkClassification}`;
+                } else if (foundAnyLink) {
+                    linkStatus = 'Issue';
+                    linkClassification = 'Mismatch';
+                    checkResult = `Issue! Anchor Text (Expected: "${anchorText}", Found: "${bestMismatchText || 'Empty/Image Link'}")`;
+                } else {
                     linkStatus = 'Not Found';
                     checkResult = `Link to ${clientDomain} not found on page`;
                 }

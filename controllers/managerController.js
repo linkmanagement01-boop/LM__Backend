@@ -27,17 +27,16 @@ const getDashboardStats = async (req, res, next) => {
         const managerId = req.user.id;
 
         // Pending Approvals for Bloggers: status 7 = blogger submitted URL, awaiting manager verification
-        // CRITICAL: Also check process status and parent order status to exclude completed tasks
+        // CRITICAL: We DO NOT check nop.status = 7 here. Bulk direct pushes share a process ID, so
+        // if one blogger submits, their nopd.status is 7. We count all individual detail submissions individually.
         const pendingBloggersResult = await query(
             `SELECT COUNT(*) as count 
              FROM new_order_process_details nopd
              JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
              JOIN new_orders o ON nop.new_order_id = o.id
              WHERE nopd.status = 7 
-               AND nop.status = 7
-               AND o.new_order_status < 5
-               AND nop.manager_id = $1`,
-            [managerId]
+               AND nopd.submit_url IS NOT NULL
+               AND o.new_order_status < 5`
         );
 
         // Pending Approvals Teams: BOTH order and process status must be 2
@@ -74,9 +73,11 @@ const getDashboardStats = async (req, res, next) => {
             [managerId]
         );
 
-        // Rejected Orders Bloggers (status 11 = Rejected)
+        // Rejected Orders Bloggers (status 11 = Rejected OR has reject_reason)
+        // Matches the logic in getRejectedOrders to show exact true count of all rejections
         const rejectedOrdersResult = await query(
-            `SELECT COUNT(*) as count FROM new_order_process_details WHERE status = 11`
+            `SELECT COUNT(*) as count FROM new_order_process_details 
+             WHERE status = 11 OR (reject_reason IS NOT NULL AND TRIM(reject_reason) != '')`
         );
 
         // Threads count
@@ -101,12 +102,10 @@ const getDashboardStats = async (req, res, next) => {
              LEFT JOIN users u ON nopd.vendor_id = u.id
              LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
              WHERE nopd.status = 7
-               AND nop.status = 7
+               AND nopd.submit_url IS NOT NULL
                AND o.new_order_status < 5
-               AND nop.manager_id = $1
              ORDER BY nopd.created_at DESC
-             LIMIT 50`,
-            [managerId]
+             LIMIT 50`
         );
 
         res.json({
@@ -364,26 +363,31 @@ const getPendingFromBloggers = async (req, res, next) => {
              JOIN new_orders no ON nop.new_order_id = no.id
              LEFT JOIN users v ON nopd.vendor_id = v.id
              WHERE nopd.status = 7 
+               AND nopd.submit_url IS NOT NULL
                AND no.new_order_status < 5
-               AND nop.manager_id = $1
-             ORDER BY nopd.updated_at DESC`,
-            [req.user.id]
+             ORDER BY nopd.updated_at DESC`
         );
 
-        // Map to frontend format matching the screenshot
+        // Map to frontend format matching the screenshot and the frontend component
         const orders = result.rows.map(row => ({
+            // Core Identity
             id: row.detail_id,
+            process_id: row.process_id,
             order_id: row.manual_order_id || `#${row.db_order_id}`,
             order_type: row.order_type,
+            client_name: row.client_name,
 
-            // Vendor/Blogger info
+            // Vendor/Blogger info (frontend expects blogger_name, blogger_email)
             vendor_id: row.vendor_id,
             vendor_name: row.vendor_name,
+            blogger_name: row.vendor_name,
             vendor_email: row.vendor_email,
+            blogger_email: row.vendor_email,
 
-            // Site info
+            // Site info (frontend expects website_url)
             root_domain: row.root_domain,
             new_site: row.root_domain,
+            website_url: row.root_domain,
             da: row.da,
             dr: row.dr,
 
@@ -396,14 +400,17 @@ const getPendingFromBloggers = async (req, res, next) => {
             statement: row.statement,
             notes: row.notes,
 
-            // Submitted URL from blogger
+            // Submitted URL from blogger (frontend expects live_published_url)
             submitted_url: row.submit_url,
             submit_url: row.submit_url,
+            live_published_url: row.submit_url,
 
-            // Status
-            status: 'Accepted',
+            // Status (frontend expects current_status)
+            status: 'Pending Verification',
             detail_status: row.detail_status,
+            current_status: 'PENDING_MANAGER_APPROVAL',
 
+            updated_at: row.created_at,
             created_at: row.created_at
         }));
 
@@ -427,13 +434,13 @@ const getRejectedOrders = async (req, res, next) => {
         const limit = parseInt(req.query.limit) || 20;
         const offset = (page - 1) * limit;
 
-        // Get total count
-        // Status 11 = old blogger rejections (before today only - today's are manager rejections)
-        // Status 12 = new blogger rejections (all time)
+        // Only use strict status codes — the reject_reason fallback was causing
+        // inflated counts by including records (status 7/8) that were later resubmitted
+        // but still had a leftover reject_reason from a previous rejection cycle.
+        // NOTE: User requested ALL rejected records (approx 1269), even those resubmitted.
         const countResult = await query(
             `SELECT COUNT(*) as total FROM new_order_process_details 
-             WHERE status = 12 
-             OR (status = 11 AND DATE(updated_at) < CURRENT_DATE)`
+             WHERE status = 11 OR (reject_reason IS NOT NULL AND TRIM(reject_reason) != '')`
         );
         const total = parseInt(countResult.rows[0]?.total || 0);
 
@@ -457,9 +464,63 @@ const getRejectedOrders = async (req, res, next) => {
              JOIN new_orders o ON nop.new_order_id = o.id
              LEFT JOIN users u ON nopd.vendor_id = u.id
              LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
-             WHERE nopd.status = 12 
-             OR (nopd.status = 11 AND DATE(nopd.updated_at) < CURRENT_DATE)
+             WHERE nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != '')
              ORDER BY nopd.updated_at DESC
+             LIMIT $1 OFFSET $2`,
+            [limit, offset]
+        );
+
+        res.json({
+            total,
+            page,
+            limit,
+            totalPages: Math.ceil(total / limit),
+            count: ordersResult.rows.length,
+            orders: ordersResult.rows
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   GET /api/manager/rejected-orders/writers
+ * @desc    Get orders rejected by writers (with reasons)
+ * @access  Manager only
+ */
+const getRejectedWriterOrders = async (req, res, next) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const offset = (page - 1) * limit;
+
+        // Count writer-rejected orders
+        const countResult = await query(
+            `SELECT COUNT(*) as total FROM new_order_processes 
+             WHERE status = 11 AND writer_id IS NOT NULL`
+        );
+        const total = parseInt(countResult.rows[0]?.total || 0);
+
+        // Get rejected orders with writer info
+        const ordersResult = await query(
+            `SELECT 
+                nop.id as process_id,
+                o.id as order_id,
+                o.order_id as manual_order_id,
+                o.client_name,
+                o.order_type,
+                o.category,
+                w.name as writer_name,
+                w.email as writer_email,
+                nop.note as reject_reason,
+                nop.status,
+                nop.created_at,
+                nop.updated_at
+             FROM new_order_processes nop
+             JOIN new_orders o ON nop.new_order_id = o.id
+             LEFT JOIN users w ON nop.writer_id = w.id
+             WHERE nop.status = 11 AND nop.writer_id IS NOT NULL
+             ORDER BY nop.updated_at DESC
              LIMIT $1 OFFSET $2`,
             [limit, offset]
         );
@@ -515,8 +576,9 @@ const getOrderDetails = async (req, res, next) => {
 
         const order = orderResult.rows[0];
 
-        // Get the process record for this order
-        const processResult = await query(
+        // Get ALL process records for this order (not just the latest)
+        // This allows us to aggregate team/writer info across the full workflow history
+        const allProcessesResult = await query(
             `SELECT 
                 nop.id,
                 nop.new_order_id,
@@ -539,12 +601,28 @@ const getOrderDetails = async (req, res, next) => {
              LEFT JOIN users t ON nop.team_id = t.id
              LEFT JOIN users w ON nop.writer_id = w.id
              WHERE nop.new_order_id = $1
-             ORDER BY nop.created_at DESC
-             LIMIT 1`,
+             ORDER BY nop.created_at ASC`,
             [id]
         );
 
-        const process = processResult.rows[0] || null;
+        const allProcesses = allProcessesResult.rows;
+        // The latest process row (used for detail records and current status)
+        const process = allProcesses.length > 0 ? allProcesses[allProcesses.length - 1] : null;
+
+        // Aggregate team_id and writer_id from the ENTIRE history of process rows + order itself
+        // This handles both imported orders (single row with all IDs) and normal orders (multiple rows where latest may have NULLs)
+        const aggregatedTeamId = allProcesses.find(p => p.team_id)?.team_id || order.team_id || null;
+        const aggregatedTeamName = allProcesses.find(p => p.team_id)?.team_name || null;
+        const aggregatedTeamEmail = allProcesses.find(p => p.team_id)?.team_email || null;
+        const teamProcess = allProcesses.find(p => p.team_id) || allProcesses[0];
+
+        const writerProcess = [...allProcesses].reverse().find(p => p.writer_id);
+        const aggregatedWriterId = writerProcess?.writer_id || null;
+        const aggregatedWriterName = writerProcess?.writer_name || null;
+        const aggregatedWriterEmail = writerProcess?.writer_email || null;
+
+        // Find the process row where writer submitted (status 3 or has doc_urls/statement)
+        const writerSubmittedProcess = allProcesses.find(p => p.status === 3) || writerProcess;
 
         // Get all detail records (blogger assignments)
         let processDetails = [];
@@ -599,66 +677,80 @@ const getOrderDetails = async (req, res, next) => {
             processDetails = detailsResult.rows;
         }
 
-        // Reconstruct workflow steps based on available data
+        // Helper to map ALL detail fields so frontend can pick per order_type
+        const mapAllFields = (d) => ({
+            id: d.id,
+            website: d.website,
+            da: d.da,
+            dr: d.dr,
+            price: d.price || d.niche_edit_price || d.gp_price || 0,
+            anchor: d.anchor,
+            target_url: d.url,
+            post_url: d.ourl,
+            title: d.title,
+            doc_urls: d.doc_urls,
+            upload_doc_file: d.upload_doc_file,
+            insert_after: d.insert_after,
+            statement: d.statement,
+            type: d.type,
+            note: d.note,
+            new_note: d.new_note,
+            verify: d.verify,
+            reject_reason: d.reject_reason,
+            blogger_name: d.blogger_name,
+            blogger_email: d.blogger_email,
+            vendor_id: d.vendor_id,
+            status: d.status,
+            status_label: d.status_label,
+            submit_url: d.submit_url,
+            created_at: d.created_at,
+            updated_at: d.updated_at
+        });
+
+        // Reconstruct workflow steps using AGGREGATED data from all process rows
         const reconstructedProcesses = [];
 
         // Step 1: Team Assignment (status=1)
-        if (process && process.team_id) {
+        // Use aggregated team info — works for both imported (single row) and normal (multi-row) orders
+        if (aggregatedTeamId) {
             reconstructedProcesses.push({
-                id: process.id,
+                id: teamProcess?.id || process?.id,
                 status: 1,
                 status_label: 'Team Assigned',
-                team_id: process.team_id,
-                team_name: process.team_name,
-                team_email: process.team_email,
-                created_at: process.created_at,
-                blogger_assignments: processDetails.map(d => ({
-                    id: d.id,
-                    website: d.website,
-                    da: d.da,
-                    dr: d.dr,
-                    price: d.price || d.niche_edit_price || d.gp_price || 0
-                }))
+                team_id: aggregatedTeamId,
+                team_name: aggregatedTeamName,
+                team_email: aggregatedTeamEmail,
+                created_at: teamProcess?.created_at || process?.created_at,
+                blogger_assignments: processDetails.map(mapAllFields)
             });
         }
 
         // Step 2: Writer Assignment (status=2)
-        if (process && process.writer_id) {
+        // Use aggregated writer info from any historical process row
+        if (aggregatedWriterId) {
             reconstructedProcesses.push({
-                id: process.id,
+                id: writerProcess?.id || process?.id,
                 status: 2,
                 status_label: 'Writer Assigned',
-                writer_id: process.writer_id,
-                writer_name: process.writer_name,
-                writer_email: process.writer_email,
-                created_at: process.created_at,
-                blogger_assignments: processDetails.map(d => ({
-                    id: d.id,
-                    website: d.website,
-                    anchor: d.anchor,
-                    ourl: d.url || d.ourl,
-                    title: d.title
-                }))
+                writer_id: aggregatedWriterId,
+                writer_name: aggregatedWriterName,
+                writer_email: aggregatedWriterEmail,
+                created_at: writerProcess?.created_at || process?.created_at,
+                blogger_assignments: processDetails.map(mapAllFields)
             });
         }
 
         // Step 3: Writer Submitted (status=3)
-        const writerSubmitted = processDetails.some(d => d.doc_urls || d.insert_after || d.statement);
-        if (process && process.writer_id && writerSubmitted) {
+        const writerSubmitted = processDetails.some(d => d.doc_urls || d.insert_after || d.statement || d.type);
+        if (aggregatedWriterId && writerSubmitted) {
             reconstructedProcesses.push({
-                id: process.id,
+                id: writerSubmittedProcess?.id || process?.id,
                 status: 3,
                 status_label: 'Writer Submitted',
-                created_at: process.updated_at || process.created_at,
-                blogger_assignments: processDetails.map(d => ({
-                    id: d.id,
-                    website: d.website,
-                    anchor: d.anchor,
-                    ourl: d.url || d.ourl,
-                    doc_urls: d.doc_urls,
-                    insert_after: d.insert_after,
-                    statement: d.statement
-                }))
+                writer_name: aggregatedWriterName,
+                writer_email: aggregatedWriterEmail,
+                created_at: writerSubmittedProcess?.updated_at || writerSubmittedProcess?.created_at || process?.updated_at || process?.created_at,
+                blogger_assignments: processDetails.map(mapAllFields)
             });
         }
 
@@ -670,19 +762,7 @@ const getOrderDetails = async (req, res, next) => {
                 status: 5,
                 status_label: 'Blogger Pushed',
                 created_at: process.updated_at || process.created_at,
-                blogger_assignments: processDetails.map(d => ({
-                    id: d.id,
-                    website: d.website,
-                    anchor: d.anchor,
-                    ourl: d.url || d.ourl,
-                    doc_urls: d.doc_urls,
-                    blogger_name: d.blogger_name,
-                    blogger_email: d.blogger_email,
-                    status: d.status,
-                    status_label: d.status_label,
-                    submit_url: d.submit_url,
-                    updated_at: d.updated_at
-                }))
+                blogger_assignments: processDetails.map(mapAllFields)
             });
         }
 
@@ -699,9 +779,9 @@ const getOrderDetails = async (req, res, next) => {
             currentStatus = 'Blogger Pushed';
         } else if (writerSubmitted) {
             currentStatus = 'Writer Submitted';
-        } else if (process?.writer_id) {
+        } else if (aggregatedWriterId) {
             currentStatus = 'Writer Assigned';
-        } else if (process?.team_id) {
+        } else if (aggregatedTeamId) {
             currentStatus = 'Team Assigned';
         }
 
@@ -1370,15 +1450,40 @@ const rejectTeamSubmission = async (req, res, next) => {
             });
         }
 
-        // Clear website selection and send back to team
-        const updated = await Task.updateStatus(id, 'PENDING_MANAGER_APPROVAL_1', {
-            website_id: null,
-            rejection_reason: reason
-        });
+        // Send back to DRAFT so team member sees it in their queue again
+        // Also update process and order status to 1 (team working)
+        const processResult = await query(
+            `SELECT id FROM new_order_processes WHERE new_order_id = $1 ORDER BY id DESC LIMIT 1`,
+            [id]
+        );
+
+        if (processResult.rows[0]) {
+            await query(
+                `UPDATE new_order_processes SET status = 11, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+                [processResult.rows[0].id]
+            );
+        }
+
+        // Update order status back to 11 (rejected)
+        await query(
+            `UPDATE new_orders SET new_order_status = 11, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            [id]
+        );
+
+        // Clear website selections and store rejection reason in process details
+        if (processResult.rows[0]) {
+            await query(
+                `UPDATE new_order_process_details 
+                 SET status = 11, reject_reason = $1, updated_at = CURRENT_TIMESTAMP 
+                 WHERE new_order_process_id = $2`,
+                [reason || 'Rejected by manager', processResult.rows[0].id]
+            );
+        }
 
         res.json({
-            message: 'Team submission rejected',
-            task: updated
+            message: 'Team submission rejected and sent back to team',
+            order_id: id,
+            rejection_reason: reason
         });
     } catch (error) {
         next(error);
@@ -1452,7 +1557,7 @@ const getWebsites = async (req, res, next) => {
         const offset = (page - 1) * limit;
 
         // Build dynamic WHERE conditions as an array
-        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`, `ns.site_status = '1'`];
+        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`];
         const queryParams = [];
         let paramIndex = 1;
 
@@ -1480,13 +1585,15 @@ const getWebsites = async (req, res, next) => {
 
         // Dropdown Filters
         if (req.query.filter_website_status) {
-            conditions.push(`ns.website_status = $${paramIndex}`);
-            queryParams.push(req.query.filter_website_status);
+            conditions.push(`ns.site_status = $${paramIndex}`);
+            const val = req.query.filter_website_status === 'Approved' ? '1' : req.query.filter_website_status === 'Rejected' ? '2' : '0';
+            queryParams.push(val);
             paramIndex++;
         }
         if (req.query.filter_status && !req.query.filter_website_status) {
-            conditions.push(`ns.website_status = $${paramIndex}`);
-            queryParams.push(req.query.filter_status);
+            conditions.push(`ns.site_status = $${paramIndex}`);
+            const val = req.query.filter_status === 'Approved' ? '1' : req.query.filter_status === 'Rejected' ? '2' : '0';
+            queryParams.push(val);
             paramIndex++;
         }
         if (req.query.filter_fc_gp) {
@@ -1515,7 +1622,9 @@ const getWebsites = async (req, res, next) => {
                 let sqlOp = '=';
                 if (op === '>') sqlOp = '>';
                 else if (op === '<') sqlOp = '<';
-                conditions.push(`COALESCE(${dbCol}::numeric, 0) ${sqlOp} $${paramIndex}`);
+                
+                const castCol = `(CASE WHEN ${dbCol}::text ~ '^[0-9]+(\\.[0-9]+)?$' THEN ${dbCol}::numeric ELSE 0 END)`;
+                conditions.push(`${castCol} ${sqlOp} $${paramIndex}`);
                 queryParams.push(parseFloat(val));
                 paramIndex++;
             }
@@ -1716,6 +1825,8 @@ const getBloggerSubmissionDetail = async (req, res, next) => {
         nopd.doc_urls,
         nopd.title,
         nopd.upload_doc_file,
+        nopd.link_status,
+        nopd.link_check_result,
         nopd.created_at,
         nopd.updated_at,
         ns.root_domain,
@@ -1726,6 +1837,7 @@ const getBloggerSubmissionDetail = async (req, res, next) => {
         v.name as vendor_name,
         v.email as vendor_email,
         nop.new_order_id as order_id,
+        no.order_id as manual_order_id,
         no.client_name,
         no.order_type,
         no.category,
@@ -1749,7 +1861,7 @@ const getBloggerSubmissionDetail = async (req, res, next) => {
         const row = result.rows[0];
         const detail = {
             id: row.detail_id,
-            order_id: row.order_id,
+            order_id: row.manual_order_id || `ORD-${row.order_id}`,
 
             // Vendor/Blogger info
             vendor_id: row.vendor_id,
@@ -1772,11 +1884,14 @@ const getBloggerSubmissionDetail = async (req, res, next) => {
             // Submission
             submitted_url: row.submit_url,
             submit_url: row.submit_url,
-            link_verification: 'Not Verified', // TODO: Add actual verification
+            link_verification: row.link_status ? `${row.link_status}${row.link_check_result ? ' - ' + row.link_check_result : ''}` : 'Not Verified',
+            link_status: row.link_status || null,
+            link_check_result: row.link_check_result || null,
             upfront_payment: row.upfront_payment || false,
 
             // Order info
             order_type: row.order_type,
+            category: row.category,
             client_name: row.client_name,
             notes: row.notes,
 
@@ -1832,7 +1947,7 @@ const finalizeFromBlogger = async (req, res, next) => {
         // Update status to 8 (completed/credited)
         await query(
             `UPDATE new_order_process_details 
-             SET status = 8, updated_at = CURRENT_TIMESTAMP
+             SET status = 8, reject_reason = NULL, updated_at = CURRENT_TIMESTAMP
              WHERE id = $1`,
             [id]
         );
@@ -1904,7 +2019,7 @@ const finalizeFromBlogger = async (req, res, next) => {
 const rejectBloggerSubmission = async (req, res, next) => {
     try {
         const { id } = req.params;
-        const { rejection_reason } = req.body;
+        const rejection_reason = req.body.rejection_reason || req.body.reject_reason;
 
         if (!rejection_reason) {
             return res.status(400).json({
@@ -1975,6 +2090,19 @@ const createOrderChain = async (req, res, next) => {
             return res.status(400).json({ error: 'Validation Error', message: 'Writer ID is required' });
         }
 
+        if (target_stage === 'blogger') {
+            for (const w of websites) {
+                const siteResult = await query('SELECT uploaded_user_id, root_domain FROM new_sites WHERE id = $1', [w.id]);
+                const vendorId = siteResult.rows[0]?.uploaded_user_id || w.vendor_id || null;
+                if (!vendorId) {
+                    return res.status(400).json({
+                        error: 'Validation Error',
+                        message: `Cannot push directly to blogger. Site "${siteResult.rows[0]?.root_domain || w.id}" does not have an assigned vendor/owner in the database.`
+                    });
+                }
+            }
+        }
+
         const orderId = manual_order_id || `ORD-${Date.now()}`;
 
         // Check duplicate
@@ -1987,7 +2115,7 @@ const createOrderChain = async (req, res, next) => {
         const orderResult = await query(
             `INSERT INTO new_orders (manager_id, team_id, order_id, client_name, client_website, no_of_links, order_type, order_package, message, category, new_order_status, fc, type, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING *`,
-            [req.user.id, 0, orderId, client_name, client_website || '', no_of_links || websites.length, order_type || 'Guest Post', order_package || '', notes || '', category || '', target_stage === 'writer' ? 3 : 5, fc ? 1 : 0, order_type || 'Guest Post']
+            [req.user.id, 0, orderId, client_name, client_website || '', no_of_links || websites.length, order_type || 'Guest Post', order_package || '', notes || '', category || '', target_stage === 'writer' ? 3 : 4, fc ? 1 : 0, order_type || 'Guest Post']
         );
         const order = orderResult.rows[0];
 
@@ -2061,30 +2189,30 @@ const rejectWriterSubmission = async (req, res, next) => {
             for (const rw of rejected_websites) {
                 await query(
                     `UPDATE new_order_process_details 
-                     SET status = 3, reject_reason = $1, updated_at = CURRENT_TIMESTAMP
+                     SET status = 11, reject_reason = $1, updated_at = CURRENT_TIMESTAMP
                      WHERE id = $2 AND new_order_process_id = $3`,
-                    [rw.reason || rejection_reason, rw.detail_id, processId]
+                    [rw.reason || rejection_reason, rw.detail_id || rw.website_id, processId]
                 );
             }
         } else {
             // Reject all details back to writer
             await query(
                 `UPDATE new_order_process_details 
-                 SET status = 3, reject_reason = $1, updated_at = CURRENT_TIMESTAMP
+                 SET status = 11, reject_reason = $1, updated_at = CURRENT_TIMESTAMP
                  WHERE new_order_process_id = $2`,
                 [rejection_reason, processId]
             );
         }
 
-        // Update process status back to 3 (with writer)
+        // Update process status to 11 (rejected)
         await query(
-            `UPDATE new_order_processes SET status = 3, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            `UPDATE new_order_processes SET status = 11, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
             [processId]
         );
 
-        // Update order status back to 3 (with writer)
+        // Update order status to 11 (rejected)
         await query(
-            `UPDATE new_orders SET new_order_status = 3, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            `UPDATE new_orders SET new_order_status = 11, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
             [id]
         );
 
@@ -2194,6 +2322,49 @@ const uploadProfileImage = async (req, res, next) => {
     }
 };
 
+/**
+ * @route   DELETE /api/manager/orders/:id
+ * @desc    Hard delete an order and cascade delete its processes and details
+ * @access  Manager only
+ */
+const deleteOrder = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+        const managerId = req.user.id;
+
+        await query('BEGIN');
+
+        // 1. Verify exact ownership/existence
+        const orderCheck = await query('SELECT id FROM new_orders WHERE id = $1 AND manager_id = $2', [id, managerId]);
+        if (orderCheck.rows.length === 0) {
+            await query('ROLLBACK');
+            return res.status(404).json({ error: 'Order not found or unauthorized' });
+        }
+
+        // 2. Cascade Details
+        await query(`
+            DELETE FROM new_order_process_details 
+            WHERE new_order_process_id IN (
+                SELECT id FROM new_order_processes WHERE new_order_id = $1
+            )
+        `, [id]);
+
+        // 3. Cascade Processes
+        await query('DELETE FROM new_order_processes WHERE new_order_id = $1', [id]);
+
+        // 4. Delete Root Order
+        await query('DELETE FROM new_orders WHERE id = $1', [id]);
+
+        await query('COMMIT');
+        res.json({ success: true, message: 'Order permanently deleted' });
+
+    } catch (error) {
+        await query('ROLLBACK');
+        console.error("Delete Order Error:", error);
+        next(error);
+    }
+};
+
 module.exports = {
     getDashboardStats,
     getTasks,
@@ -2205,6 +2376,7 @@ module.exports = {
     getPendingFromTeams,
     getPendingFromWriters,
     getRejectedOrders,
+    getRejectedWriterOrders,
     createOrder,
     assignToTeam,
     assignToWriter,
@@ -2229,5 +2401,6 @@ module.exports = {
     rejectWriterSubmission,
     getProfile,
     updateProfile,
-    uploadProfileImage
+    uploadProfileImage,
+    deleteOrder
 };

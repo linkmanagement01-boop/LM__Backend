@@ -75,6 +75,13 @@ const login = async (req, res, next) => {
         logger.auth('Login', email, true);
         logger.success('Auth', { userId: user.id, role: user.role });
 
+        // Update login tracking metadata
+        const { query } = require('../config/database');
+        await query(
+            'UPDATE users SET last_login = CURRENT_TIMESTAMP, login_count = COALESCE(login_count, 0) + 1 WHERE id = $1',
+            [user.id]
+        );
+
         // Return user data and token
         res.json({
             message: 'Login successful',
@@ -82,9 +89,11 @@ const login = async (req, res, next) => {
             user: {
                 id: user.id,
                 username: user.username,
+                name: user.name,
                 email: user.email,
                 role: user.role,
-                wallet_balance: user.wallet_balance
+                wallet_balance: user.wallet_balance,
+                profile_image: user.profile_image
             }
         });
 
@@ -128,10 +137,12 @@ const getCurrentUser = async (req, res, next) => {
             user: {
                 id: user.id,
                 username: user.username,
+                name: user.name,
                 email: user.email,
                 role: user.role,
                 wallet_balance: user.wallet_balance,
                 is_active: user.is_active,
+                profile_image: user.profile_image,
                 created_at: user.created_at
             }
         });
@@ -205,7 +216,7 @@ const register = async (req, res, next) => {
         }
 
         // Hash password
-        const bcrypt = require('bcrypt');
+        const bcrypt = require('bcryptjs');
         const hashedPassword = await bcrypt.hash(password, 10);
 
         // Import database query
@@ -280,15 +291,24 @@ const changePassword = async (req, res, next) => {
             });
         }
 
-        const user = await User.findById(req.user.id);
-        if (!user) {
+        // Fetch user WITH password column (User.findById does NOT select password)
+        const { query } = require('../config/database');
+        const userResult = await query(
+            'SELECT id, password FROM users WHERE id = $1',
+            [req.user.id]
+        );
+
+        if (userResult.rows.length === 0) {
             return res.status(404).json({
                 error: 'Not Found',
                 message: 'User not found'
             });
         }
 
-        const isOldPasswordValid = await User.verifyPassword(old_password, user.password_hash);
+        const storedPassword = userResult.rows[0].password;
+
+        const bcrypt = require('bcryptjs');
+        const isOldPasswordValid = await bcrypt.compare(old_password, storedPassword);
         if (!isOldPasswordValid) {
             return res.status(401).json({
                 error: 'Authentication Failed',
@@ -296,10 +316,8 @@ const changePassword = async (req, res, next) => {
             });
         }
 
-        const bcrypt = require('bcrypt');
         const hashedPassword = await bcrypt.hash(new_password, 10);
 
-        const { query } = require('../config/database');
         await query(
             `UPDATE users SET password = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
             [hashedPassword, req.user.id]
@@ -311,11 +329,42 @@ const changePassword = async (req, res, next) => {
     }
 };
 
+/**
+ * @route   GET /api/auth/permissions
+ * @desc    Get current user profile permissions
+ * @access  Private
+ */
+const getMyPermissions = async (req, res, next) => {
+    try {
+        const { query } = require('../config/database');
+        const result = await query(
+            'SELECT permissions FROM users WHERE id = $1',
+            [req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        const userPermissionsStr = result.rows[0].permissions;
+
+        // Parse JSONB permissions or default to empty object
+        const permissions = typeof userPermissionsStr === 'string'
+            ? JSON.parse(userPermissionsStr || '{}')
+            : (userPermissionsStr || {});
+
+        res.json({ permissions });
+    } catch (error) {
+        next(error);
+    }
+};
+
 module.exports = {
     login,
     logout,
     getCurrentUser,
     register,
-    changePassword
+    changePassword,
+    getMyPermissions
 };
 

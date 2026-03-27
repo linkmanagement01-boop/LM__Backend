@@ -37,5 +37,12 @@ router.get('/me', authenticate, authController.getCurrentUser);
  */
 router.put('/change-password', authenticate, authController.changePassword);
 
+/**
+ * @route   GET /api/auth/permissions
+ * @desc    Get current user permissions
+ * @access  Private
+ */
+router.get('/permissions', authenticate, authController.getMyPermissions);
+
 module.exports = router;
 

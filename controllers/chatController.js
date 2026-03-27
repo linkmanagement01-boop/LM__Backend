@@ -48,6 +48,21 @@ const getChatUsers = async (req, res, next) => {
                 [currentUserId]
             );
             users = result.rows;
+        } else if (role === 'vendor') {
+            // Bloggers only see the manager who pushed their latest order
+            const result = await query(
+                `SELECT DISTINCT ON (m.id) m.id, m.name, m.email, m.role,
+                    COALESCE(m.profile_image, '') as avatar
+                 FROM new_order_process_details nopd
+                 JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+                 JOIN new_orders no ON nop.new_order_id = no.id
+                 JOIN users m ON no.manager_id = m.id
+                 WHERE nopd.vendor_id = $1
+                 ORDER BY m.id, nopd.created_at DESC
+                 LIMIT 1`,
+                [currentUserId]
+            );
+            users = result.rows;
         } else {
             // Others can chat with Managers
             const result = await query(
@@ -216,7 +231,7 @@ const getMessages = async (req, res, next) => {
         );
 
         res.json({
-            messages: messagesResult.rows.reverse(), // Chronological order
+            messages: messagesResult.rows, // Newest first
             total: countResult.rows[0].total,
             page,
             limit,
@@ -371,6 +386,21 @@ const searchUsers = async (req, res, next) => {
                    role, name
                  LIMIT 30`,
                 [currentUserId, `%${searchTerm.toLowerCase()}%`, `${searchTerm.toLowerCase()}%`]
+            );
+            users = result.rows;
+        } else if (role === 'vendor') {
+            // Bloggers only search their latest manager
+            const result = await query(
+                `SELECT DISTINCT ON (m.id) m.id, m.name, m.email, m.role,
+                    COALESCE(m.profile_image, '') as avatar
+                 FROM new_order_process_details nopd
+                 JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+                 JOIN new_orders no ON nop.new_order_id = no.id
+                 JOIN users m ON no.manager_id = m.id
+                 WHERE nopd.vendor_id = $1
+                 ORDER BY m.id, nopd.created_at DESC
+                 LIMIT 1`,
+                [currentUserId]
             );
             users = result.rows;
         } else {

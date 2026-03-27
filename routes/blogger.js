@@ -46,6 +46,7 @@ router.get('/tasks', bloggerController.getMyTasks);
 router.get('/tasks/:id', bloggerController.getTaskById);
 router.post('/tasks/:id/submit-link', bloggerController.submitLiveLink);
 router.post('/tasks/:id/reject', bloggerController.rejectTask);
+router.post('/check-link', bloggerController.checkLinkStatus);
 
 // ==================== WALLET MANAGEMENT ====================
 router.get('/wallet', bloggerController.getWallet);

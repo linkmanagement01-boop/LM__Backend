@@ -5,3 +5,15 @@ node_modules/
 uploads/
 *.csv
 pg_data.sql
+pg_data_fixed.sql
+pg_data_latest.sql
+pg_data_clean.sql
+pg_data_final.sql
+test*.js
+test.jpg
+0
+apply_db_fix.js
+check_*.js
+createAccountant.js
+fix_*.js
+scripts/

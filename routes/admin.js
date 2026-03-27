@@ -1,17 +1,47 @@
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const adminController = require('../controllers/adminController');
 const adminSitesController = require('../controllers/adminSitesController');
 const managerController = require('../controllers/managerController');
 const { authenticate, authorize } = require('../middleware/auth');
 
-// All routes require Admin role
+// Ensure profile upload directory exists
+const profileUploadDir = path.join(__dirname, '../uploads/profiles');
+if (!fs.existsSync(profileUploadDir)) {
+    fs.mkdirSync(profileUploadDir, { recursive: true });
+}
+
+// Profile image upload config
+const profileStorage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, profileUploadDir),
+    filename: (req, file, cb) => cb(null, `admin-${req.user.id}-${Date.now()}${path.extname(file.originalname)}`)
+});
+const profileUpload = multer({ storage: profileStorage, limits: { fileSize: 2 * 1024 * 1024 } });
+
+// ==================== WALLET & INVOICE MANAGEMENT (Shared: Admin & Accountant) ====================
+const walletAuth = [authenticate, authorize('Admin', 'Accountant')];
+router.get('/bloggers-stats', ...walletAuth, adminController.getBloggerStats);
+router.get('/wallet/bloggers', ...walletAuth, adminController.getBloggersWallets);
+router.get('/wallet/payment-history', ...walletAuth, adminController.getPaymentHistory);
+router.get('/wallet/withdrawal-requests', ...walletAuth, adminController.getWithdrawalRequests);
+router.get('/wallet/withdrawal-requests/:id', ...walletAuth, adminController.getWithdrawalRequestDetail);
+router.put('/wallet/withdrawal-requests/:id/approve', ...walletAuth, adminController.approveWithdrawal);
+router.put('/wallet/withdrawal-requests/:id/reject', ...walletAuth, adminController.rejectWithdrawal);
+router.get('/wallet/invoices/:id', ...walletAuth, adminController.getInvoiceDetail);
+router.get('/wallet/invoices/:id/pdf', ...walletAuth, adminController.downloadInvoicePdf);
+
+// All other routes require securely strict Admin role
 router.use(authenticate, authorize('Admin'));
 
 // ==================== ORDERS MANAGEMENT (reuse manager functions) ====================
 router.get('/orders', managerController.getOrders);
 router.get('/orders/:id/details', managerController.getOrderDetails);
 router.patch('/orders/:id', managerController.updateOrder);
+router.get('/rejected-orders', managerController.getRejectedOrders);
+router.get('/rejected-orders/writers', managerController.getRejectedWriterOrders);
 
 // ==================== USER MANAGEMENT ====================
 router.get('/users', adminController.getAllUsers);
@@ -22,6 +52,7 @@ router.put('/users/:id/reset-password', adminController.resetUserPassword);
 router.put('/users/:id/change-password', adminController.changeUserPassword);
 router.get('/users/:id/permissions', adminController.getUserPermissions);
 router.put('/users/:id/permissions', adminController.updateUserPermissions);
+router.post('/users/:id/impersonate', adminController.impersonateUser);
 
 // ==================== BLOGGER PERFORMANCE ====================
 router.get('/bloggers/:id/performance', adminController.getBloggerPerformance);
@@ -55,18 +86,7 @@ router.post('/price-charts', adminController.createPriceChart);
 router.put('/price-charts/:id', adminController.updatePriceChart);
 router.delete('/price-charts/:id', adminController.deletePriceChart);
 
-// ==================== WALLET MANAGEMENT ====================
-router.get('/bloggers-stats', adminController.getBloggerStats);
-router.get('/wallet/bloggers', adminController.getBloggersWallets);
-router.get('/wallet/payment-history', adminController.getPaymentHistory);
-router.get('/wallet/withdrawal-requests', adminController.getWithdrawalRequests);
-router.get('/wallet/withdrawal-requests/:id', adminController.getWithdrawalRequestDetail);
-router.put('/wallet/withdrawal-requests/:id/approve', adminController.approveWithdrawal);
-router.put('/wallet/withdrawal-requests/:id/reject', adminController.rejectWithdrawal);
-
-// ==================== INVOICE MANAGEMENT ====================
-router.get('/wallet/invoices/:id', adminController.getInvoiceDetail);
-router.get('/wallet/invoices/:id/pdf', adminController.downloadInvoicePdf);
+// Wallet endpoints lifted above strict Admin block
 
 // ==================== CREATE ACCOUNT FROM SITES ====================
 router.get('/sites/pending-accounts', adminController.getSitesForAccountCreation);
@@ -80,6 +100,9 @@ router.put('/sites/pending-bulk/:id/reject', adminController.rejectBulkRequest);
 
 // ==================== SITES LIST (View All Sites) ====================
 router.get('/sites/list', adminController.getWebsitesList);
+router.get('/sites/deleted-list', adminController.getDeletedWebsitesList);
+router.put('/sites/:id/delete', adminController.deleteWebsite);
+router.put('/sites/:id/restore', adminController.restoreWebsite);
 
 // ==================== CAREERS MANAGEMENT ====================
 router.get('/careers', adminController.getCareers);
@@ -115,6 +138,11 @@ router.post('/sites/check-link-status', adminSitesController.checkLinkStatus);
 router.post('/sites/bulk-check', adminSitesController.startBulkCheck);
 router.get('/sites/bulk-check-status', adminSitesController.getBulkCheckStatus);
 router.post('/sites/stop-bulk-check', adminSitesController.stopBulkCheck);
+
+// ==================== PROFILE MANAGEMENT ====================
+router.get('/profile', adminController.getProfile);
+router.put('/profile', adminController.updateProfile);
+router.post('/profile/image', profileUpload.single('profile_image'), adminController.uploadProfileImage);
 
 module.exports = router;
 

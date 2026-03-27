@@ -2,12 +2,19 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs');
 const managerController = require('../controllers/managerController');
 const { authenticate, authorize } = require('../middleware/auth');
 
+// Ensure profile upload directory exists
+const profileUploadDir = path.join(__dirname, '../uploads/profiles');
+if (!fs.existsSync(profileUploadDir)) {
+    fs.mkdirSync(profileUploadDir, { recursive: true });
+}
+
 // Profile image upload config
 const profileStorage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, 'uploads/profiles/'),
+    destination: (req, file, cb) => cb(null, profileUploadDir),
     filename: (req, file, cb) => cb(null, `manager-${req.user.id}-${Date.now()}${path.extname(file.originalname)}`)
 });
 const profileUpload = multer({ storage: profileStorage, limits: { fileSize: 2 * 1024 * 1024 } });
@@ -34,6 +41,8 @@ router.get('/orders', managerController.getOrders);
 router.get('/orders/:id/details', managerController.getOrderDetails);
 // Update an order
 router.patch('/orders/:id', managerController.updateOrder);
+// Delete an order permanently
+router.delete('/orders/:id', managerController.deleteOrder);
 // Get pending orders from bloggers
 router.get('/pending-from-bloggers', managerController.getPendingFromBloggers);
 // Get pending orders from teams
@@ -42,6 +51,8 @@ router.get('/pending-from-teams', managerController.getPendingFromTeams);
 router.get('/pending-from-writers', managerController.getPendingFromWriters);
 // Get rejected orders
 router.get('/rejected-orders', managerController.getRejectedOrders);
+// Get orders rejected by writers
+router.get('/rejected-orders/writers', managerController.getRejectedWriterOrders);
 
 // WORKFLOW STEP 1: Create Order and push to Team
 router.post('/orders', managerController.createOrder);

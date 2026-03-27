@@ -104,7 +104,7 @@ const submitContent = async (req, res, next) => {
             return res.status(403).json({ error: 'Forbidden', message: 'This task is not assigned to you' });
         }
 
-        if (task.current_status !== 'ASSIGNED_TO_WRITER' && task.current_status !== 'WRITING_IN_PROGRESS') {
+        if (task.current_status !== 'ASSIGNED_TO_WRITER' && task.current_status !== 'WRITING_IN_PROGRESS' && task.current_status !== 'REJECTED') {
             return res.status(400).json({
                 error: 'Invalid Status',
                 message: `Cannot submit content for task with status: ${task.current_status}`
@@ -258,11 +258,15 @@ const getDashboardStats = async (req, res, next) => {
              JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
              WHERE nop.writer_id = $1 
                AND nop.status >= 3
-               AND (nopd.doc_urls IS NOT NULL AND nopd.doc_urls != '')`,
+               AND ((nopd.doc_urls IS NOT NULL AND nopd.doc_urls != '') 
+                 OR (nopd.insert_after IS NOT NULL AND nopd.insert_after != '') 
+                 OR (nopd.statement IS NOT NULL AND nopd.statement != '')
+                 OR (nopd.upload_doc_file IS NOT NULL AND nopd.upload_doc_file != ''))`,
             [writerId]
         );
 
-        // 2. Order Added Notifications - tasks assigned to writer (all time)
+        // 2. Order Added Notifications - active tasks currently with writer (status 3)
+        // Must check ONLY the latest process record for the order, as historical records may also have status 3
         const ordersAddedResult = await dbQuery(
             `SELECT 
                 nop.id,
@@ -271,14 +275,20 @@ const getDashboardStats = async (req, res, next) => {
                 no.client_website,
                 no.order_type,
                 nop.created_at
-             FROM new_order_processes nop
-             JOIN new_orders no ON nop.new_order_id = no.id
+             FROM new_orders no
+             JOIN LATERAL (
+                 SELECT id, status, writer_id, created_at
+                 FROM new_order_processes
+                 WHERE new_order_id = no.id
+                 ORDER BY id DESC LIMIT 1
+             ) nop ON true
              WHERE nop.writer_id = $1 
+               AND nop.status = 3
              ORDER BY nop.created_at DESC`,
             [writerId]
         );
 
-        // 3. Rejected Notifications - tasks rejected by manager
+        // 3. Rejected Notifications - tasks currently rejected by manager (status 11)
         const rejectedResult = await dbQuery(
             `SELECT 
                 nop.id,
@@ -288,8 +298,13 @@ const getDashboardStats = async (req, res, next) => {
                 no.order_type,
                 nop.status,
                 nop.created_at
-             FROM new_order_processes nop
-             JOIN new_orders no ON nop.new_order_id = no.id
+             FROM new_orders no
+             JOIN LATERAL (
+                 SELECT id, status, writer_id, created_at
+                 FROM new_order_processes
+                 WHERE new_order_id = no.id
+                 ORDER BY id DESC LIMIT 1
+             ) nop ON true
              WHERE nop.writer_id = $1 
                AND nop.status = 11
              ORDER BY nop.created_at DESC`,
@@ -297,9 +312,16 @@ const getDashboardStats = async (req, res, next) => {
         );
 
         // 4. Threads - pending tasks (assigned but not yet submitted)
+        // This is essentially the same as active tasks (status 3)
         const threadsResult = await dbQuery(
             `SELECT COUNT(DISTINCT nop.id) as count
-             FROM new_order_processes nop
+             FROM new_orders no
+             JOIN LATERAL (
+                 SELECT id, status, writer_id
+                 FROM new_order_processes
+                 WHERE new_order_id = no.id
+                 ORDER BY id DESC LIMIT 1
+             ) nop ON true
              WHERE nop.writer_id = $1 
                AND nop.status = 3`,
             [writerId]
@@ -374,7 +396,10 @@ const getCompletedOrders = async (req, res, next) => {
              LEFT JOIN users m ON no.manager_id = m.id
              WHERE nop.writer_id = $1 
                AND nop.status >= 3
-               AND (nopd.doc_urls IS NOT NULL AND nopd.doc_urls != '')
+               AND ((nopd.doc_urls IS NOT NULL AND nopd.doc_urls != '') 
+                 OR (nopd.insert_after IS NOT NULL AND nopd.insert_after != '') 
+                 OR (nopd.statement IS NOT NULL AND nopd.statement != '')
+                 OR (nopd.upload_doc_file IS NOT NULL AND nopd.upload_doc_file != ''))
              ORDER BY nop.id DESC, nop.updated_at DESC`,
             [writerId]
         );
@@ -610,6 +635,79 @@ const uploadProfileImage = async (req, res, next) => {
     }
 };
 
+/**
+ * @route   POST /api/writer/tasks/:id/reject
+ * @desc    Writer rejects an assigned task with a reason
+ * @access  Writer only
+ */
+const rejectTask = async (req, res, next) => {
+    try {
+        const { id } = req.params; // This is the order id (new_orders.id)
+        const { reject_reason } = req.body;
+        const writerId = req.user.id;
+
+        if (!reject_reason || reject_reason.trim().length === 0) {
+            return res.status(400).json({
+                error: 'Validation Error',
+                message: 'Rejection reason is required'
+            });
+        }
+
+        // Get the task to verify ownership
+        const task = await Task.findById(id);
+        if (!task) {
+            return res.status(404).json({ error: 'Not Found', message: 'Task not found' });
+        }
+
+        if (String(task.assigned_writer_id) !== String(writerId)) {
+            return res.status(403).json({ error: 'Forbidden', message: 'This task is not assigned to you' });
+        }
+
+        if (task.current_status !== 'ASSIGNED_TO_WRITER' && task.current_status !== 'WRITING_IN_PROGRESS') {
+            return res.status(400).json({
+                error: 'Invalid Status',
+                message: `Cannot reject task with status: ${task.current_status}`
+            });
+        }
+
+        const { query: dbQuery } = require('../config/database');
+
+        // Get the latest process for this order
+        const processResult = await dbQuery(
+            `SELECT id FROM new_order_processes WHERE new_order_id = $1 ORDER BY id DESC LIMIT 1`,
+            [id]
+        );
+
+        if (processResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Not Found', message: 'Process not found for this order' });
+        }
+
+        const processId = processResult.rows[0].id;
+
+        // Update process status to 11 (Rejected) and save reason in note column
+        await dbQuery(
+            `UPDATE new_order_processes 
+             SET status = 11, note = $1, updated_at = CURRENT_TIMESTAMP 
+             WHERE id = $2`,
+            [reject_reason.trim(), processId]
+        );
+
+        // Also update the order-level status
+        await dbQuery(
+            `UPDATE new_orders SET new_order_status = 11, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+            [id]
+        );
+
+        res.json({
+            message: 'Order rejected successfully',
+            order_id: id,
+            reject_reason: reject_reason.trim()
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
 module.exports = {
     getMyTasks,
     getTaskById,
@@ -620,6 +718,7 @@ module.exports = {
     getCompletedOrderDetail,
     getProfile,
     updateProfile,
-    uploadProfileImage
+    uploadProfileImage,
+    rejectTask
 };
 

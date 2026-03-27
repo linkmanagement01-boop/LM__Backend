@@ -1,11 +1,16 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../config/database');
+const { authenticate, authorize } = require('../middleware/auth');
 
 /**
  * System Config Routes
  * Manage system-wide configuration
+ * All routes require Admin authentication
  */
+
+// Protect all config routes - require authentication + admin role
+router.use(authenticate, authorize('super_admin', 'admin'));
 
 /**
  * @route   GET /api/config

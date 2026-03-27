@@ -2,12 +2,28 @@ const express = require('express');
 const router = express.Router();
 const teamController = require('../controllers/teamController');
 const { authenticate, authorize } = require('../middleware/auth');
+const multer = require('multer');
+const path = require('path');
+
+// Configure multer for profile image uploads
+const profileUpload = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR ? path.join(process.env.UPLOAD_DIR, 'profiles') : 'uploads/profiles/'),
+        filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
+    })
+});
 
 // All routes require Team role
 router.use(authenticate, authorize('Team'));
 
 // Dashboard
 router.get('/dashboard', teamController.getDashboardStats);
+
+// ==================== PROFILE MANAGEMENT ====================
+router.get('/profile', teamController.getProfile);
+router.put('/profile', teamController.updateProfile);
+router.post('/profile/image', profileUpload.single('profile_image'), teamController.uploadProfileImage);
+router.get('/permissions', teamController.getMyPermissions);
 
 // ==================== ORDER NOTIFICATIONS (Push to Manager Flow) ====================
 // Get orders pushed by Manager (Order Added Notifications)

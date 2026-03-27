@@ -883,7 +883,7 @@ const getThreads = async (req, res, next) => {
     try {
         const result = await query(
             `SELECT t.*, u.name as user_name,
-                    (SELECT COUNT(*) FROM messages m WHERE m.thread_id = t.id) as message_count
+                    (SELECT COUNT(*) FROM thread_messages m WHERE m.thread_id = t.id) as message_count
              FROM threads t
              LEFT JOIN users u ON t.user_id = u.id
              WHERE t.owner_id = $1
@@ -936,7 +936,7 @@ const getThreadMessages = async (req, res, next) => {
 
         const result = await query(
             `SELECT m.*, u.name as sender_name
-             FROM messages m
+             FROM thread_messages m
              LEFT JOIN users u ON m.user_id = u.id
              WHERE m.thread_id = $1
              ORDER BY m.created_at ASC`,
@@ -964,7 +964,7 @@ const sendMessage = async (req, res, next) => {
         }
 
         const result = await query(
-            `INSERT INTO messages (thread_id, user_id, message, created_at, updated_at)
+            `INSERT INTO thread_messages (thread_id, user_id, message, created_at, updated_at)
              VALUES ($1, $2, $3, NOW(), NOW())
              RETURNING *`,
             [id, req.user.id, message]
@@ -974,6 +974,133 @@ const sendMessage = async (req, res, next) => {
             message: 'Message sent successfully',
             data: result.rows[0]
         });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// ==================== PROFILE MANAGEMENT ====================
+
+/**
+ * @route   GET /api/team/profile
+ * @desc    Get current team member's profile
+ * @access  Team only
+ */
+const getProfile = async (req, res, next) => {
+    try {
+        const result = await query(
+            `SELECT id, name, email, gender, mobile_number, profile_image, whatsapp, skype, created_at
+             FROM users WHERE id = $1`,
+            [req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                error: 'Not Found',
+                message: 'User not found'
+            });
+        }
+
+        const user = result.rows[0];
+        res.json({
+            id: user.id,
+            name: user.name,
+            email: user.email,
+            gender: user.gender || '',
+            mobile: user.mobile_number || '',
+            profile_image: user.profile_image || '',
+            whatsapp: user.whatsapp || '',
+            skype: user.skype || '',
+            created_at: user.created_at
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   PUT /api/team/profile
+ * @desc    Update current team member's profile
+ * @access  Team only
+ */
+const updateProfile = async (req, res, next) => {
+    try {
+        const { name, gender, mobile } = req.body;
+
+        if (!name || !name.trim()) {
+            return res.status(400).json({
+                error: 'Validation Error',
+                message: 'Name is required'
+            });
+        }
+
+        await query(
+            `UPDATE users SET name = $1, gender = $2, mobile_number = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4`,
+            [name.trim(), gender || null, mobile || null, req.user.id]
+        );
+
+        res.json({ message: 'Profile updated successfully' });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   POST /api/team/profile/image
+ * @desc    Upload team member profile image
+ * @access  Team only
+ */
+const uploadProfileImage = async (req, res, next) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({
+                error: 'Validation Error',
+                message: 'No image file provided'
+            });
+        }
+
+        const imagePath = `/uploads/profiles/${req.file.filename}`;
+
+        await query(
+            `UPDATE users SET profile_image = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+            [imagePath, req.user.id]
+        );
+
+        res.json({
+            message: 'Profile image uploaded successfully',
+            profile_image: imagePath
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   GET /api/team/permissions
+ * @desc    Get team member's permissions
+ * @access  Team only
+ */
+const getMyPermissions = async (req, res, next) => {
+    try {
+        const userId = req.user.id;
+
+        const result = await query(
+            'SELECT permissions FROM users WHERE id = $1',
+            [userId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        const userPermissionsStr = result.rows[0].permissions;
+
+        // Parse JSONB permissions or default to empty object
+        const permissions = typeof userPermissionsStr === 'string'
+            ? JSON.parse(userPermissionsStr || '{}')
+            : (userPermissionsStr || {});
+
+        res.json({ permissions });
     } catch (error) {
         next(error);
     }
@@ -998,6 +1125,10 @@ module.exports = {
     getThreads,
     createThread,
     getThreadMessages,
-    sendMessage
+    sendMessage,
+    getProfile,
+    updateProfile,
+    uploadProfileImage,
+    getMyPermissions
 };
 

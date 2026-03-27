@@ -1,6 +1,9 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
 const http = require('http');
 const path = require('path');
 const { Server } = require('socket.io');
@@ -43,6 +46,10 @@ const isOriginAllowed = (origin) => {
   if (allowedOrigins.includes(origin)) return true;
   if (origin.endsWith('.trycloudflare.com')) return true;
   if (origin.endsWith('.femur.studio')) return true;
+  
+  // Allow local network IPs for testing from other PCs
+  if (origin.match(/^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/)) return true;
+  
   return false;
 };
 console.log(`🔒 CORS configured for origins: ${allowedOrigins.join(', ')}`);
@@ -138,6 +145,24 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
+// Security Headers
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" } // Allow accessing /uploads from different origins
+}));
+
+// GZIP Compression
+app.use(compression());
+
+// API Rate Limiting
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 300, // Limit each IP to 300 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' }
+});
+app.use('/api/', apiLimiter);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -194,7 +219,7 @@ app.use((req, res) => {
 app.use(errorHandler);
 
 // Start server with Socket.io
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server is running on port ${PORT}`);
   console.log(`🔌 Socket.io enabled for real-time updates`);
   console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);

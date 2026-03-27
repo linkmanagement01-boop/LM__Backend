@@ -63,7 +63,16 @@ const authorize = (...allowedRoles) => {
             });
         }
 
-        if (!allowedRoles.includes(req.user.role)) {
+        // Normalize role comparison: DB stores lowercase roles ('manager', 'vendor', 'writer', 'team')
+        // but routes use capitalized names ('Manager', 'Blogger', 'Writer', 'Team')
+        // Also map legacy 'vendor' role to 'Blogger'
+        const userRole = (req.user.role || '').toLowerCase();
+        const normalizedAllowed = allowedRoles.map(r => r.toLowerCase());
+        
+        // Map 'vendor' to 'blogger' for role matching
+        const effectiveRole = userRole === 'vendor' ? 'blogger' : userRole;
+
+        if (!normalizedAllowed.includes(effectiveRole)) {
             return res.status(403).json({
                 error: 'Forbidden',
                 message: `Access denied. Required role: ${allowedRoles.join(' or ')}`

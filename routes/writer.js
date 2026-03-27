@@ -97,5 +97,12 @@ router.get('/profile', writerController.getProfile);
 router.put('/profile', writerController.updateProfile);
 router.post('/profile/image', profileUpload.single('profile_image'), writerController.uploadProfileImage);
 
+/**
+ * @route   POST /api/writer/tasks/:id/reject
+ * @desc    Writer rejects an assigned task
+ * @access  Writer only
+ */
+router.post('/tasks/:id/reject', writerController.rejectTask);
+
 module.exports = router;
 
