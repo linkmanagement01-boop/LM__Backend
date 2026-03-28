@@ -344,6 +344,8 @@ const getPendingFromBloggers = async (req, res, next) => {
                 nopd.statement,
                 nopd.note as notes,
                 nopd.upfront_payment,
+                nopd.link_status,
+                nopd.link_check_result,
                 nopd.created_at,
                 ns.root_domain,
                 ns.da,
@@ -409,6 +411,10 @@ const getPendingFromBloggers = async (req, res, next) => {
             status: 'Pending Verification',
             detail_status: row.detail_status,
             current_status: 'PENDING_MANAGER_APPROVAL',
+
+            // Link verification status
+            link_status: row.link_status || 'Pending',
+            link_check_result: row.link_check_result || '',
 
             updated_at: row.created_at,
             created_at: row.created_at
