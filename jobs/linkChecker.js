@@ -41,7 +41,7 @@ async function checkSingleLink(link) {
         if (response.status === 404) {
             linkStatus = 'Not Found';
             checkResult = 'Page Not Found (404)';
-        } else if (response.status !== 200) {
+        } else if (response.status < 200 || response.status >= 300) {
             linkStatus = 'Issue';
             checkResult = `Issue! Status ${response.status}`;
         } else {
