@@ -329,16 +329,7 @@ class Task {
         // Generate order ID if not provided
         const orderId = manual_order_id || `ORD-${Date.now()}`;
 
-        // Check if order_id already exists (uniqueness validation)
-        const existingOrder = await query(
-            'SELECT id FROM new_orders WHERE order_id = $1',
-            [orderId]
-        );
-        if (existingOrder.rows.length > 0) {
-            const error = new Error(`Order ID "${orderId}" already exists. Please use a unique ID.`);
-            error.statusCode = 400;
-            throw error;
-        }
+        // Sub-orders are allowed to reuse existing order IDs
 
         const result = await query(
             `INSERT INTO new_orders (

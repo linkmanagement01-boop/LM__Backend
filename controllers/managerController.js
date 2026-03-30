@@ -2111,11 +2111,7 @@ const createOrderChain = async (req, res, next) => {
 
         const orderId = manual_order_id || `ORD-${Date.now()}`;
 
-        // Check duplicate
-        const existing = await query('SELECT id FROM new_orders WHERE order_id = $1', [orderId]);
-        if (existing.rows.length > 0) {
-            return res.status(400).json({ error: 'Validation Error', message: `Order ID "${orderId}" already exists` });
-        }
+        // Sub-orders are allowed to reuse existing order IDs
 
         // Create order
         const orderResult = await query(
