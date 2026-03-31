@@ -97,9 +97,9 @@ const getMyTasks = async (req, res, next) => {
             price: (() => {
                 const type = (row.order_type || '').toLowerCase();
                 if (type.includes('niche') || type.includes('edit') || type.includes('insertion')) {
-                    return row.niche_price || row.gp_price || 0;
+                    return (row.niche_price && !isNaN(parseFloat(row.niche_price))) ? parseFloat(row.niche_price) : 0;
                 }
-                return row.gp_price || row.niche_price || 0;
+                return (row.gp_price && !isNaN(parseFloat(row.gp_price))) ? parseFloat(row.gp_price) : 0;
             })(),
 
             // Order details
