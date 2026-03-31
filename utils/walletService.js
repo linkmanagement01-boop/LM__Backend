@@ -129,15 +129,17 @@ const getUnapprovedCreditsBalance = async (bloggerId) => {
         // 2. OR they have a wallet_history with approved_date set
         const result = await query(
             `SELECT COALESCE(SUM(
-                COALESCE(
-                    NULLIF(nopd.price, 0), 
-                    CASE WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION ELSE NULL END,
-                    CASE WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION ELSE NULL END,
-                    0
-                )
+                CASE
+                    WHEN nopd.price IS NOT NULL AND nopd.price > 0 THEN nopd.price
+                    WHEN LOWER(no.order_type) LIKE '%niche%' OR LOWER(no.order_type) LIKE '%edit%' OR LOWER(no.order_type) LIKE '%insertion%'
+                        THEN CASE WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION ELSE 0 END
+                    ELSE CASE WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION ELSE 0 END
+                END
             ), 0) as total
              FROM new_order_process_details nopd
              JOIN new_sites ns ON nopd.new_site_id = ns.id
+             JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+             JOIN new_orders no ON nop.new_order_id = no.id
              WHERE nopd.vendor_id = $1 
                AND nopd.status = 8
                AND nopd.id NOT IN (
