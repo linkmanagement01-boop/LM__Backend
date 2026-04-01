@@ -253,20 +253,21 @@ class Transaction {
                             ELSE 0 END
                 END as credit,
                 wh.type,
-                wh.status,
+                COALESCE(wh_debit.status, wh.status) as status,
                 wh.created_at as date,
-                wh.request_date,
-                wh.approved_date,
+                COALESCE(wh_debit.request_date, wh.request_date) as request_date,
+                COALESCE(wh_debit.approved_date, wh.approved_date) as approved_date,
                 nopd.submit_url,
                 ns.root_domain,
                 no.order_id as order_id
              FROM wallet_histories wh
              JOIN wallets w ON wh.wallet_id = w.id
+             LEFT JOIN wallet_histories wh_debit ON wh_debit.order_detail_id = wh.order_detail_id AND wh_debit.type = 'debit'
              LEFT JOIN new_order_process_details nopd ON wh.order_detail_id = nopd.id
              LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
              LEFT JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
              LEFT JOIN new_orders no ON nop.new_order_id = no.id
-             WHERE w.user_id = $1
+             WHERE w.user_id = $1 AND wh.type = 'credit'
              ORDER BY wh.created_at DESC
              LIMIT $2`,
             [userId, limit]
