@@ -520,10 +520,19 @@ const getInvoices = async (req, res, next) => {
                 wr.updated_at,
                 COALESCE(SUM(
                     CASE 
-                        WHEN wh.price > 0 THEN wh.price
                         WHEN LOWER(no.order_type) LIKE '%niche%' OR LOWER(no.order_type) LIKE '%edit%' OR LOWER(no.order_type) LIKE '%insertion%'
-                            THEN CASE WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION ELSE 0 END
-                        ELSE CASE WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION ELSE 0 END
+                            THEN CASE 
+                                WHEN no.fc = 1 AND ns.fc_ne IS NOT NULL AND REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$' AND REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION > 0
+                                    THEN REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                                WHEN REGEXP_REPLACE(COALESCE(ns.niche_edit_price::text,'0'), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$'
+                                    THEN REGEXP_REPLACE(ns.niche_edit_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                                ELSE 0 END
+                        ELSE CASE 
+                                WHEN no.fc = 1 AND ns.fc_gp IS NOT NULL AND REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$' AND REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION > 0
+                                    THEN REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                                WHEN REGEXP_REPLACE(COALESCE(ns.gp_price::text,'0'), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$'
+                                    THEN REGEXP_REPLACE(ns.gp_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                                ELSE 0 END
                     END
                 ), 0) as amount,
                 MAX(wh.payment_method) as payment_method,
@@ -1139,10 +1148,19 @@ const getWithdrawableOrders = async (req, res, next) => {
             `SELECT 
                 nopd.id as detail_id,
                 CASE
-                    WHEN nopd.price IS NOT NULL AND nopd.price > 0 THEN nopd.price
                     WHEN LOWER(no.order_type) LIKE '%niche%' OR LOWER(no.order_type) LIKE '%edit%' OR LOWER(no.order_type) LIKE '%insertion%'
-                        THEN CASE WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION ELSE 0 END
-                    ELSE CASE WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION ELSE 0 END
+                        THEN CASE 
+                            WHEN no.fc = 1 AND ns.fc_ne IS NOT NULL AND REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$' AND REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION > 0
+                                THEN REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            WHEN REGEXP_REPLACE(COALESCE(ns.niche_edit_price::text,'0'), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$'
+                                THEN REGEXP_REPLACE(ns.niche_edit_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            ELSE 0 END
+                    ELSE CASE 
+                            WHEN no.fc = 1 AND ns.fc_gp IS NOT NULL AND REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$' AND REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION > 0
+                                THEN REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            WHEN REGEXP_REPLACE(COALESCE(ns.gp_price::text,'0'), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$'
+                                THEN REGEXP_REPLACE(ns.gp_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            ELSE 0 END
                 END as price,
                 nopd.submit_url,
                 nopd.updated_at as date,
@@ -1841,10 +1859,19 @@ const getInvoiceDetail = async (req, res, next) => {
                 wh.id,
                 wh.order_detail_id,
                 CASE 
-                    WHEN wh.price > 0 THEN wh.price
                     WHEN LOWER(no.order_type) LIKE '%niche%' OR LOWER(no.order_type) LIKE '%edit%' OR LOWER(no.order_type) LIKE '%insertion%'
-                        THEN CASE WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION ELSE 0 END
-                    ELSE CASE WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION ELSE 0 END
+                        THEN CASE 
+                            WHEN no.fc = 1 AND ns.fc_ne IS NOT NULL AND REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$' AND REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION > 0
+                                THEN REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            WHEN REGEXP_REPLACE(COALESCE(ns.niche_edit_price::text,'0'), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$'
+                                THEN REGEXP_REPLACE(ns.niche_edit_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            ELSE 0 END
+                    ELSE CASE 
+                            WHEN no.fc = 1 AND ns.fc_gp IS NOT NULL AND REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$' AND REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION > 0
+                                THEN REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            WHEN REGEXP_REPLACE(COALESCE(ns.gp_price::text,'0'), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$'
+                                THEN REGEXP_REPLACE(ns.gp_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            ELSE 0 END
                 END as price,
                 nopd.submit_url,
                 ns.root_domain,
@@ -1930,10 +1957,19 @@ const downloadInvoicePdf = async (req, res, next) => {
         const itemsResult = await query(
             `SELECT 
                 CASE 
-                    WHEN wh.price > 0 THEN wh.price
                     WHEN LOWER(no.order_type) LIKE '%niche%' OR LOWER(no.order_type) LIKE '%edit%' OR LOWER(no.order_type) LIKE '%insertion%'
-                        THEN CASE WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION ELSE 0 END
-                    ELSE CASE WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION ELSE 0 END
+                        THEN CASE 
+                            WHEN no.fc = 1 AND ns.fc_ne IS NOT NULL AND REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$' AND REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION > 0
+                                THEN REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            WHEN REGEXP_REPLACE(COALESCE(ns.niche_edit_price::text,'0'), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$'
+                                THEN REGEXP_REPLACE(ns.niche_edit_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            ELSE 0 END
+                    ELSE CASE 
+                            WHEN no.fc = 1 AND ns.fc_gp IS NOT NULL AND REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$' AND REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION > 0
+                                THEN REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            WHEN REGEXP_REPLACE(COALESCE(ns.gp_price::text,'0'), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$'
+                                THEN REGEXP_REPLACE(ns.gp_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            ELSE 0 END
                 END as price,
                 nopd.submit_url, 
                 ns.root_domain, 

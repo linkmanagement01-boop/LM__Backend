@@ -130,10 +130,439 @@ const getUnapprovedCreditsBalance = async (bloggerId) => {
         const result = await query(
             `SELECT COALESCE(SUM(
                 CASE
-                    WHEN nopd.price IS NOT NULL AND nopd.price > 0 THEN nopd.price
                     WHEN LOWER(no.order_type) LIKE '%niche%' OR LOWER(no.order_type) LIKE '%edit%' OR LOWER(no.order_type) LIKE '%insertion%'
-                        THEN CASE WHEN ns.niche_edit_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.niche_edit_price::DOUBLE PRECISION ELSE 0 END
-                    ELSE CASE WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION ELSE 0 END
+                        THEN CASE 
+                            WHEN no.fc = 1 AND ns.fc_ne IS NOT NULL AND REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?
+            ), 0) as total
+             FROM new_order_process_details nopd
+             JOIN new_sites ns ON nopd.new_site_id = ns.id
+             JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+             JOIN new_orders no ON nop.new_order_id = no.id
+             WHERE nopd.vendor_id = $1 
+               AND nopd.status = 8
+               AND nopd.id NOT IN (
+                   -- Exclude orders that are in an APPROVED withdrawal request
+                   SELECT wh.order_detail_id 
+                   FROM wallet_histories wh
+                   JOIN withdraw_requests wr ON wh.withdraw_request_id = wr.id
+                   WHERE wr.status = 1  -- 1 = Approved
+                     AND wh.order_detail_id IS NOT NULL
+               )
+               AND nopd.id NOT IN (
+                   -- Also exclude orders with approved_date set on their wallet_history
+                   SELECT wh2.order_detail_id
+                   FROM wallet_histories wh2
+                   WHERE wh2.approved_date IS NOT NULL
+                     AND wh2.order_detail_id IS NOT NULL
+               )`,
+            [bloggerId]
+        );
+
+        return parseFloat(result.rows[0]?.total || 0);
+    } catch (error) {
+        console.error('❌ Error getting unapproved credits balance:', error);
+        return 0;
+    }
+};
+
+/**
+ * Get available balance (wallet balance - pending withdrawals)
+ */
+const getAvailableBalance = async (bloggerId) => {
+    try {
+        const walletBalance = await User.getWalletBalance(bloggerId);
+        const pendingAmount = await Transaction.getPendingAmount(bloggerId);
+
+        return (walletBalance || 0) - (pendingAmount || 0);
+    } catch (error) {
+        console.error('❌ Error getting available balance:', error);
+        return 0;
+    }
+};
+
+/**
+ * Process withdrawal approval
+ * Deducts amount from wallet when withdrawal is approved
+ */
+const processWithdrawalApproval = async (transactionId, managerId) => {
+    try {
+        // Get transaction details
+        const txn = await Transaction.findById(transactionId);
+
+        if (!txn) {
+            throw new Error('Transaction not found');
+        }
+
+        if (txn.status !== 'Requested' && txn.status !== 'Processing') {
+            throw new Error('Transaction already processed');
+        }
+
+        // Deduct from wallet and approve transaction
+        const result = await transaction(async (client) => {
+            // Deduct from wallet
+            await client.query(
+                `UPDATE wallets 
+                 SET wallet = wallet - $1, updated_at = CURRENT_TIMESTAMP
+                 WHERE user_id = $2`,
+                [txn.amount, txn.user_id]
+            );
+
+            // Approve transaction in withdraw_requests
+            const approveResult = await client.query(
+                `UPDATE withdraw_requests 
+                 SET status = 1,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1
+                 RETURNING *`,
+                [transactionId]
+            );
+
+            return approveResult.rows[0];
+        });
+
+        return {
+            ...result,
+            status: 'Paid'
+        };
+    } catch (error) {
+        console.error('❌ Error processing withdrawal approval:', error);
+        throw error;
+    }
+};
+
+module.exports = {
+    addCreditToBloggerWallet,
+    deductFromWallet,
+    getAvailableBalance,
+    getUnapprovedCreditsBalance,
+    processWithdrawalApproval
+};
+ AND REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION > 0
+                                THEN REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            WHEN REGEXP_REPLACE(COALESCE(ns.niche_edit_price::text,'0'), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?
+            ), 0) as total
+             FROM new_order_process_details nopd
+             JOIN new_sites ns ON nopd.new_site_id = ns.id
+             JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+             JOIN new_orders no ON nop.new_order_id = no.id
+             WHERE nopd.vendor_id = $1 
+               AND nopd.status = 8
+               AND nopd.id NOT IN (
+                   -- Exclude orders that are in an APPROVED withdrawal request
+                   SELECT wh.order_detail_id 
+                   FROM wallet_histories wh
+                   JOIN withdraw_requests wr ON wh.withdraw_request_id = wr.id
+                   WHERE wr.status = 1  -- 1 = Approved
+                     AND wh.order_detail_id IS NOT NULL
+               )
+               AND nopd.id NOT IN (
+                   -- Also exclude orders with approved_date set on their wallet_history
+                   SELECT wh2.order_detail_id
+                   FROM wallet_histories wh2
+                   WHERE wh2.approved_date IS NOT NULL
+                     AND wh2.order_detail_id IS NOT NULL
+               )`,
+            [bloggerId]
+        );
+
+        return parseFloat(result.rows[0]?.total || 0);
+    } catch (error) {
+        console.error('❌ Error getting unapproved credits balance:', error);
+        return 0;
+    }
+};
+
+/**
+ * Get available balance (wallet balance - pending withdrawals)
+ */
+const getAvailableBalance = async (bloggerId) => {
+    try {
+        const walletBalance = await User.getWalletBalance(bloggerId);
+        const pendingAmount = await Transaction.getPendingAmount(bloggerId);
+
+        return (walletBalance || 0) - (pendingAmount || 0);
+    } catch (error) {
+        console.error('❌ Error getting available balance:', error);
+        return 0;
+    }
+};
+
+/**
+ * Process withdrawal approval
+ * Deducts amount from wallet when withdrawal is approved
+ */
+const processWithdrawalApproval = async (transactionId, managerId) => {
+    try {
+        // Get transaction details
+        const txn = await Transaction.findById(transactionId);
+
+        if (!txn) {
+            throw new Error('Transaction not found');
+        }
+
+        if (txn.status !== 'Requested' && txn.status !== 'Processing') {
+            throw new Error('Transaction already processed');
+        }
+
+        // Deduct from wallet and approve transaction
+        const result = await transaction(async (client) => {
+            // Deduct from wallet
+            await client.query(
+                `UPDATE wallets 
+                 SET wallet = wallet - $1, updated_at = CURRENT_TIMESTAMP
+                 WHERE user_id = $2`,
+                [txn.amount, txn.user_id]
+            );
+
+            // Approve transaction in withdraw_requests
+            const approveResult = await client.query(
+                `UPDATE withdraw_requests 
+                 SET status = 1,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1
+                 RETURNING *`,
+                [transactionId]
+            );
+
+            return approveResult.rows[0];
+        });
+
+        return {
+            ...result,
+            status: 'Paid'
+        };
+    } catch (error) {
+        console.error('❌ Error processing withdrawal approval:', error);
+        throw error;
+    }
+};
+
+module.exports = {
+    addCreditToBloggerWallet,
+    deductFromWallet,
+    getAvailableBalance,
+    getUnapprovedCreditsBalance,
+    processWithdrawalApproval
+};
+
+                                THEN REGEXP_REPLACE(ns.niche_edit_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            ELSE 0 END
+                    ELSE CASE 
+                            WHEN no.fc = 1 AND ns.fc_gp IS NOT NULL AND REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?
+            ), 0) as total
+             FROM new_order_process_details nopd
+             JOIN new_sites ns ON nopd.new_site_id = ns.id
+             JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+             JOIN new_orders no ON nop.new_order_id = no.id
+             WHERE nopd.vendor_id = $1 
+               AND nopd.status = 8
+               AND nopd.id NOT IN (
+                   -- Exclude orders that are in an APPROVED withdrawal request
+                   SELECT wh.order_detail_id 
+                   FROM wallet_histories wh
+                   JOIN withdraw_requests wr ON wh.withdraw_request_id = wr.id
+                   WHERE wr.status = 1  -- 1 = Approved
+                     AND wh.order_detail_id IS NOT NULL
+               )
+               AND nopd.id NOT IN (
+                   -- Also exclude orders with approved_date set on their wallet_history
+                   SELECT wh2.order_detail_id
+                   FROM wallet_histories wh2
+                   WHERE wh2.approved_date IS NOT NULL
+                     AND wh2.order_detail_id IS NOT NULL
+               )`,
+            [bloggerId]
+        );
+
+        return parseFloat(result.rows[0]?.total || 0);
+    } catch (error) {
+        console.error('❌ Error getting unapproved credits balance:', error);
+        return 0;
+    }
+};
+
+/**
+ * Get available balance (wallet balance - pending withdrawals)
+ */
+const getAvailableBalance = async (bloggerId) => {
+    try {
+        const walletBalance = await User.getWalletBalance(bloggerId);
+        const pendingAmount = await Transaction.getPendingAmount(bloggerId);
+
+        return (walletBalance || 0) - (pendingAmount || 0);
+    } catch (error) {
+        console.error('❌ Error getting available balance:', error);
+        return 0;
+    }
+};
+
+/**
+ * Process withdrawal approval
+ * Deducts amount from wallet when withdrawal is approved
+ */
+const processWithdrawalApproval = async (transactionId, managerId) => {
+    try {
+        // Get transaction details
+        const txn = await Transaction.findById(transactionId);
+
+        if (!txn) {
+            throw new Error('Transaction not found');
+        }
+
+        if (txn.status !== 'Requested' && txn.status !== 'Processing') {
+            throw new Error('Transaction already processed');
+        }
+
+        // Deduct from wallet and approve transaction
+        const result = await transaction(async (client) => {
+            // Deduct from wallet
+            await client.query(
+                `UPDATE wallets 
+                 SET wallet = wallet - $1, updated_at = CURRENT_TIMESTAMP
+                 WHERE user_id = $2`,
+                [txn.amount, txn.user_id]
+            );
+
+            // Approve transaction in withdraw_requests
+            const approveResult = await client.query(
+                `UPDATE withdraw_requests 
+                 SET status = 1,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1
+                 RETURNING *`,
+                [transactionId]
+            );
+
+            return approveResult.rows[0];
+        });
+
+        return {
+            ...result,
+            status: 'Paid'
+        };
+    } catch (error) {
+        console.error('❌ Error processing withdrawal approval:', error);
+        throw error;
+    }
+};
+
+module.exports = {
+    addCreditToBloggerWallet,
+    deductFromWallet,
+    getAvailableBalance,
+    getUnapprovedCreditsBalance,
+    processWithdrawalApproval
+};
+ AND REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION > 0
+                                THEN REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            WHEN REGEXP_REPLACE(COALESCE(ns.gp_price::text,'0'), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?
+            ), 0) as total
+             FROM new_order_process_details nopd
+             JOIN new_sites ns ON nopd.new_site_id = ns.id
+             JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+             JOIN new_orders no ON nop.new_order_id = no.id
+             WHERE nopd.vendor_id = $1 
+               AND nopd.status = 8
+               AND nopd.id NOT IN (
+                   -- Exclude orders that are in an APPROVED withdrawal request
+                   SELECT wh.order_detail_id 
+                   FROM wallet_histories wh
+                   JOIN withdraw_requests wr ON wh.withdraw_request_id = wr.id
+                   WHERE wr.status = 1  -- 1 = Approved
+                     AND wh.order_detail_id IS NOT NULL
+               )
+               AND nopd.id NOT IN (
+                   -- Also exclude orders with approved_date set on their wallet_history
+                   SELECT wh2.order_detail_id
+                   FROM wallet_histories wh2
+                   WHERE wh2.approved_date IS NOT NULL
+                     AND wh2.order_detail_id IS NOT NULL
+               )`,
+            [bloggerId]
+        );
+
+        return parseFloat(result.rows[0]?.total || 0);
+    } catch (error) {
+        console.error('❌ Error getting unapproved credits balance:', error);
+        return 0;
+    }
+};
+
+/**
+ * Get available balance (wallet balance - pending withdrawals)
+ */
+const getAvailableBalance = async (bloggerId) => {
+    try {
+        const walletBalance = await User.getWalletBalance(bloggerId);
+        const pendingAmount = await Transaction.getPendingAmount(bloggerId);
+
+        return (walletBalance || 0) - (pendingAmount || 0);
+    } catch (error) {
+        console.error('❌ Error getting available balance:', error);
+        return 0;
+    }
+};
+
+/**
+ * Process withdrawal approval
+ * Deducts amount from wallet when withdrawal is approved
+ */
+const processWithdrawalApproval = async (transactionId, managerId) => {
+    try {
+        // Get transaction details
+        const txn = await Transaction.findById(transactionId);
+
+        if (!txn) {
+            throw new Error('Transaction not found');
+        }
+
+        if (txn.status !== 'Requested' && txn.status !== 'Processing') {
+            throw new Error('Transaction already processed');
+        }
+
+        // Deduct from wallet and approve transaction
+        const result = await transaction(async (client) => {
+            // Deduct from wallet
+            await client.query(
+                `UPDATE wallets 
+                 SET wallet = wallet - $1, updated_at = CURRENT_TIMESTAMP
+                 WHERE user_id = $2`,
+                [txn.amount, txn.user_id]
+            );
+
+            // Approve transaction in withdraw_requests
+            const approveResult = await client.query(
+                `UPDATE withdraw_requests 
+                 SET status = 1,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1
+                 RETURNING *`,
+                [transactionId]
+            );
+
+            return approveResult.rows[0];
+        });
+
+        return {
+            ...result,
+            status: 'Paid'
+        };
+    } catch (error) {
+        console.error('❌ Error processing withdrawal approval:', error);
+        throw error;
+    }
+};
+
+module.exports = {
+    addCreditToBloggerWallet,
+    deductFromWallet,
+    getAvailableBalance,
+    getUnapprovedCreditsBalance,
+    processWithdrawalApproval
+};
+
+                                THEN REGEXP_REPLACE(ns.gp_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                            ELSE 0 END
                 END
             ), 0) as total
              FROM new_order_process_details nopd

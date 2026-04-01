@@ -1944,7 +1944,7 @@ const finalizeFromBlogger = async (req, res, next) => {
 
         // Get the detail first
         const detailResult = await query(
-            `SELECT nopd.*, ns.root_domain, ns.niche_edit_price as niche_price, ns.gp_price, v.name as vendor_name, no.order_type
+            `SELECT nopd.*, ns.root_domain, ns.niche_edit_price as niche_price, ns.gp_price, ns.fc_gp, ns.fc_ne, v.name as vendor_name, no.order_type, no.fc
              FROM new_order_process_details nopd
              JOIN new_sites ns ON nopd.new_site_id = ns.id
              JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
@@ -1971,17 +1971,25 @@ const finalizeFromBlogger = async (req, res, next) => {
             [id]
         );
 
-        // Credit the blogger's wallet - strictly match price to order_type
-        // Parse prices properly since they may be VARCHAR with "N/A" or other non-numeric values
+        // Credit the blogger's wallet - strictly match price to order_type + FC
+        // Strip non-numeric characters (like $) from price strings before parsing
+        const cleanPrice = (val) => {
+            if (!val) return 0;
+            const cleaned = String(val).replace(/[^0-9.]/g, '');
+            const parsed = parseFloat(cleaned);
+            return isNaN(parsed) ? 0 : parsed;
+        };
+
         let amount = 0;
         if (credit_amount) {
             amount = parseFloat(credit_amount);
         } else {
             const orderType = (detail.order_type || '').toLowerCase();
+            const isFC = detail.fc == 1 || detail.fc === true;
             if (orderType.includes('niche') || orderType.includes('edit') || orderType.includes('insertion')) {
-                amount = (detail.niche_price && !isNaN(parseFloat(detail.niche_price))) ? parseFloat(detail.niche_price) : 0;
+                amount = (isFC && cleanPrice(detail.fc_ne) > 0) ? cleanPrice(detail.fc_ne) : cleanPrice(detail.niche_price);
             } else {
-                amount = (detail.gp_price && !isNaN(parseFloat(detail.gp_price))) ? parseFloat(detail.gp_price) : 0;
+                amount = (isFC && cleanPrice(detail.fc_gp) > 0) ? cleanPrice(detail.fc_gp) : cleanPrice(detail.gp_price);
             }
         }
 
