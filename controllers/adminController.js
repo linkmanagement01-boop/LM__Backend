@@ -3361,19 +3361,20 @@ const downloadInvoicePdf = async (req, res, next) => {
         doc.text(`Date: ${new Date(wr.created_at).toLocaleDateString()}`, { align: 'right' });
         doc.moveDown();
 
-        // Bill From (Blogger)
+        // Bill From (Company)
         doc.fontSize(12).font('Helvetica-Bold').text('Bill From:');
-        doc.fontSize(10).font('Helvetica').text(wr.name);
-        doc.text(`Email: ${wr.email}`);
-        doc.text(`Phone: ${wr.phone || 'N/A'}`);
-        doc.text(`Country: ${wr.country_name || 'N/A'}`);
+        doc.fontSize(10).font('Helvetica').text('RankMeup Services');
+        doc.text('# SCO 105 3rd Floor Ranjit Avenue B Block Amritsar');
+        doc.text('Punjab, India 143001');
+        doc.text('Email:- contact@rankmeup.in');
+        doc.text('Phone no = 7087825869');
         doc.moveDown();
 
-        // Bill To (Company)
+        // Bill To (Blogger)
         doc.fontSize(12).font('Helvetica-Bold').text('Bill To:');
-        doc.fontSize(10).font('Helvetica').text('Link Management');
-        doc.text('Digital Services HQ');
-        doc.text('support@linkmanagement.com');
+        doc.fontSize(10).font('Helvetica').text(wr.name);
+        doc.text(`Email: ${wr.email}`);
+        doc.text(`Country: ${wr.country_name || 'N/A'}`);
         doc.moveDown();
 
         // Items Table Header

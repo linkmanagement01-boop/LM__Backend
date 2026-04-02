@@ -1858,6 +1858,7 @@ const getInvoiceDetail = async (req, res, next) => {
             `SELECT 
                 wh.id,
                 wh.order_detail_id,
+                wh.remarks,
                 CASE 
                     WHEN LOWER(no.order_type) LIKE '%niche%' OR LOWER(no.order_type) LIKE '%edit%' OR LOWER(no.order_type) LIKE '%insertion%'
                         THEN CASE 
@@ -1888,6 +1889,13 @@ const getInvoiceDetail = async (req, res, next) => {
 
         // Calculate total
         const totalAmount = itemsResult.rows.reduce((sum, row) => sum + parseFloat(row.price || 0), 0);
+
+        // Extract the invoice note from the withdrawal request remarks.
+        let invoiceNote = 'Thank you for your business!';
+        const validRemarkObj = itemsResult.rows.find(row => row.remarks && row.remarks.trim() !== '');
+        if (validRemarkObj) {
+            invoiceNote = validRemarkObj.remarks.trim();
+        }
 
         // Format date
         const formatDate = (dateStr) => {
@@ -1922,7 +1930,7 @@ const getInvoiceDetail = async (req, res, next) => {
                 amount: `$${parseFloat(row.price || 0).toFixed(2)}`
             })),
             total: `$${totalAmount.toFixed(2)}`,
-            note: 'Thank you for your business!'
+            note: invoiceNote
         });
     } catch (error) {
         next(error);
@@ -2001,19 +2009,20 @@ const downloadInvoicePdf = async (req, res, next) => {
         doc.text(`Date: ${new Date(wr.created_at).toLocaleDateString()}`, { align: 'right' });
         doc.moveDown();
 
-        // Bill From (Blogger)
+        // Bill From (Company)
         doc.fontSize(12).font('Helvetica-Bold').text('Bill From:');
-        doc.fontSize(10).font('Helvetica').text(wr.name);
-        doc.text(`Email: ${wr.email}`);
-        doc.text(`Phone: ${wr.phone || 'N/A'}`);
-        doc.text(`Country: ${wr.country_name || 'N/A'}`);
+        doc.fontSize(10).font('Helvetica').text('RankMeup Services');
+        doc.text('# SCO 105 3rd Floor Ranjit Avenue B Block Amritsar');
+        doc.text('Punjab, India 143001');
+        doc.text('Email:- contact@rankmeup.in');
+        doc.text('Phone no = 7087825869');
         doc.moveDown();
 
-        // Bill To (Company)
+        // Bill To (Blogger)
         doc.fontSize(12).font('Helvetica-Bold').text('Bill To:');
-        doc.fontSize(10).font('Helvetica').text('Link Management');
-        doc.text('Digital Services HQ');
-        doc.text('support@linkmanagement.com');
+        doc.fontSize(10).font('Helvetica').text(wr.name);
+        doc.text(`Email: ${wr.email}`);
+        doc.text(`Country: ${wr.country_name || 'N/A'}`);
         doc.moveDown();
 
         // Items Table Header
