@@ -32,6 +32,7 @@ router.put('/wallet/withdrawal-requests/:id/approve', ...walletAuth, adminContro
 router.put('/wallet/withdrawal-requests/:id/reject', ...walletAuth, adminController.rejectWithdrawal);
 router.get('/wallet/invoices/:id', ...walletAuth, adminController.getInvoiceDetail);
 router.get('/wallet/invoices/:id/pdf', ...walletAuth, adminController.downloadInvoicePdf);
+router.post('/wallet/recalculate/:userId', ...walletAuth, adminController.recalculateWallet);
 
 // All other routes require securely strict Admin role
 router.use(authenticate, authorize('Admin'));

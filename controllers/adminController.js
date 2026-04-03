@@ -3818,6 +3818,86 @@ const uploadProfileImage = async (req, res, next) => {
     }
 };
 
+/**
+ * @route   POST /api/admin/wallet/recalculate/:userId
+ * @desc    Recalculate a blogger's wallet balance — removes orphaned credits 
+ *          from rejected orders and sets balance to the true value.
+ * @access  Admin only
+ */
+const recalculateWallet = async (req, res, next) => {
+    try {
+        const { userId } = req.params;
+
+        // 1. Get the blogger's wallet
+        const walletRes = await query(
+            'SELECT id, balance FROM wallets WHERE user_id = $1',
+            [userId]
+        );
+        if (walletRes.rows.length === 0) {
+            return res.status(404).json({ error: 'Not Found', message: 'Wallet not found for this user' });
+        }
+        const walletId = walletRes.rows[0].id;
+        const oldBalance = parseFloat(walletRes.rows[0].balance || 0);
+
+        // 2. Find orphaned credits — credit entries whose linked order_detail has been rejected (status 11 or 12)
+        const orphanedRes = await query(`
+            SELECT wh.id as wh_id, wh.price, wh.order_detail_id, nopd.status as detail_status, no.order_id
+            FROM wallet_histories wh
+            LEFT JOIN new_order_process_details nopd ON wh.order_detail_id = nopd.id
+            LEFT JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+            LEFT JOIN new_orders no ON nop.new_order_id = no.id
+            WHERE wh.wallet_id = $1 AND wh.type = 'credit'
+              AND nopd.status IN (11, 12)
+        `, [walletId]);
+
+        const orphanedIds = orphanedRes.rows.map(r => r.wh_id);
+        const orphanedTotal = orphanedRes.rows.reduce((sum, r) => sum + parseFloat(r.price || 0), 0);
+
+        // 3. Delete orphaned credit rows
+        if (orphanedIds.length > 0) {
+            await query(
+                'DELETE FROM wallet_histories WHERE id = ANY($1)',
+                [orphanedIds]
+            );
+        }
+
+        // 4. Recalculate the TRUE wallet balance: sum(credits) - sum(debits)
+        const creditSum = await query(
+            `SELECT COALESCE(SUM(CAST(price AS NUMERIC)), 0) as total 
+             FROM wallet_histories WHERE wallet_id = $1 AND type = 'credit'`,
+            [walletId]
+        );
+        const debitSum = await query(
+            `SELECT COALESCE(SUM(CAST(price AS NUMERIC)), 0) as total 
+             FROM wallet_histories WHERE wallet_id = $1 AND type = 'debit'`,
+            [walletId]
+        );
+        const trueBalance = parseFloat(creditSum.rows[0].total) - parseFloat(debitSum.rows[0].total);
+
+        // 5. Update wallet balance
+        await query(
+            'UPDATE wallets SET balance = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+            [trueBalance, walletId]
+        );
+
+        res.json({
+            message: 'Wallet recalculated successfully',
+            user_id: userId,
+            old_balance: oldBalance,
+            orphaned_credits_removed: orphanedRes.rows.map(r => ({
+                wh_id: r.wh_id,
+                order_id: r.order_id,
+                amount: r.price,
+                detail_status: r.detail_status
+            })),
+            orphaned_total: orphanedTotal,
+            new_balance: trueBalance
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
 module.exports = {
     getAllUsers,
     createUser,
@@ -3903,6 +3983,8 @@ module.exports = {
     // Profile Management
     getProfile,
     updateProfile,
-    uploadProfileImage
+    uploadProfileImage,
+    // Wallet Recalculation
+    recalculateWallet
 };
 
