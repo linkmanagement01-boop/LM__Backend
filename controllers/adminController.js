@@ -63,7 +63,7 @@ const createUser = async (req, res, next) => {
         }
 
         // Validate role
-        const validRoles = ['Admin', 'Manager', 'Team', 'Writer', 'Blogger'];
+        const validRoles = ['Admin', 'Manager', 'Team', 'Writer', 'Blogger', 'Accountant'];
         if (!validRoles.includes(role)) {
             return res.status(400).json({
                 error: 'Validation Error',
@@ -3581,7 +3581,7 @@ const updateUserPermissions = async (req, res, next) => {
             } else {
                 // If it's totally invalid, we can just optionally ignore the role update part 
                 // and proceed with permissions, or strictly fail. Let's strictly fail with a better message.
-                return res.status(400).json({ message: `Invalid role provided: ${permissions.role}. System expected one of: Admin, Manager, Team, Writer, Blogger` });
+                return res.status(400).json({ message: `Invalid role provided: ${permissions.role}. System expected one of: Admin, Manager, Team, Writer, Blogger, Accountant` });
             }
         }
 
