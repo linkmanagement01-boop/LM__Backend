@@ -759,7 +759,7 @@ const addSite = async (req, res, next) => {
                 niche_edit_price, gp_price, site_status, uploaded_user_id,
                 sample_url, email, spam_score, traffic_source, fc_gp, fc_ne,
                 marked_sponsor, accept_grey_niche, created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '1', $9, $10, $11, $12, $13, $14, $15, $16, $17, CURRENT_TIMESTAMP) 
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '0', $9, $10, $11, $12, $13, $14, $15, $16, $17, CURRENT_TIMESTAMP) 
             RETURNING *`,
             [
                 domainToUse,
@@ -1766,6 +1766,7 @@ const rejectTask = async (req, res, next) => {
         // Verify the detail belongs to this blogger
         const detailCheck = await query(
             `SELECT nopd.id, nopd.vendor_id, nopd.status,
+                    nopd.new_order_process_id,
                     ns.root_domain
              FROM new_order_process_details nopd
              JOIN new_sites ns ON nopd.new_site_id = ns.id
@@ -1814,11 +1815,38 @@ const rejectTask = async (req, res, next) => {
             [rejection_reason, id]
         );
 
+        // Check if all details for this process are completed or rejected by blogger
+        const processCheck = await query(
+            `SELECT COUNT(*) as pending FROM new_order_process_details 
+             WHERE new_order_process_id = $1 AND status NOT IN (8, 12)`,
+            [detail.new_order_process_id]
+        );
+
+        const allLinksResolved = parseInt(processCheck.rows[0].pending) === 0;
+
+        // If all details are resolved, update process AND order status to completed
+        if (allLinksResolved) {
+            await query(
+                `UPDATE new_order_processes SET status = 8, updated_at = CURRENT_TIMESTAMP 
+                 WHERE id = $1`,
+                [detail.new_order_process_id]
+            );
+
+            await query(
+                `UPDATE new_orders SET new_order_status = 5, updated_at = CURRENT_TIMESTAMP 
+                 WHERE id = (SELECT new_order_id FROM new_order_processes WHERE id = $1)`,
+                [detail.new_order_process_id]
+            );
+        }
+
         res.json({
-            message: 'Task rejected successfully. Manager will be notified.',
+            message: allLinksResolved
+                ? 'Task rejected. All links in this order are now resolved — order marked as Completed.'
+                : 'Task rejected successfully. Manager will be notified.',
             detail_id: id,
             root_domain: detail.root_domain,
-            rejection_reason
+            rejection_reason,
+            all_links_resolved: allLinksResolved
         });
     } catch (error) {
         next(error);

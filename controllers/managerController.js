@@ -2054,10 +2054,10 @@ const finalizeFromBlogger = async (req, res, next) => {
             }
         }
 
-        // Check if all details for this process are completed
+        // Check if all details for this process are completed or rejected by blogger
         const processCheck = await query(
             `SELECT COUNT(*) as pending FROM new_order_process_details 
-             WHERE new_order_process_id = $1 AND status != 8`,
+             WHERE new_order_process_id = $1 AND status NOT IN (8, 12)`,
             [detail.new_order_process_id]
         );
 
