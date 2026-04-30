@@ -3,6 +3,7 @@ const Transaction = require('../models/Transaction');
 const { isTransitionAllowed } = require('../utils/statusTransitions');
 const { addCreditToBloggerWallet, processWithdrawalApproval } = require('../utils/walletService');
 const { query } = require('../config/database');
+const { sendOrderAssignedEmail } = require('../utils/emailService');
 
 /**
  * Manager Controller
@@ -1733,6 +1734,7 @@ const getWebsites = async (req, res, next) => {
 const pushToBloggers = async (req, res, next) => {
     try {
         const { id } = req.params; // order ID
+        const sendEmailFlag = req.body.send_email !== false; // default true
 
         // Get the latest process for this order
         const processResult = await query(
@@ -1833,10 +1835,41 @@ VALUES(gen_random_uuid(), 'order_assigned', 'App\\Models\\User', $1, $2, CURRENT
             });
         }
 
+        // Send grouped email notifications per blogger (if toggle is ON)
+        if (sendEmailFlag && pushedTasks.length > 0) {
+            try {
+                // Group tasks by vendor (blogger)
+                const grouped = {};
+                for (const task of pushedTasks) {
+                    if (!task.vendor_email) continue;
+                    if (!grouped[task.vendor_id]) {
+                        grouped[task.vendor_id] = { email: task.vendor_email, name: task.vendor_name, tasks: [] };
+                    }
+                    // Get order_id for this task
+                    const orderIdResult = await query(
+                        `SELECT no.order_id FROM new_order_process_details nopd JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id JOIN new_orders no ON nop.new_order_id = no.id WHERE nopd.id = $1`,
+                        [task.detail_id]
+                    );
+                    grouped[task.vendor_id].tasks.push({
+                        root_domain: task.root_domain,
+                        order_id: orderIdResult.rows[0]?.order_id || `ORD-${id}`
+                    });
+                }
+                // Send ONE email per blogger
+                for (const vendorId of Object.keys(grouped)) {
+                    const g = grouped[vendorId];
+                    sendOrderAssignedEmail(g.email, g.name, g.tasks);
+                }
+            } catch (emailErr) {
+                console.error('Order assigned email failed (non-blocking):', emailErr.message);
+            }
+        }
+
         res.json({
             message: 'Tasks pushed to bloggers successfully',
             pushed_count: pushedTasks.length,
-            tasks: pushedTasks
+            tasks: pushedTasks,
+            emails_sent: sendEmailFlag
         });
     } catch (error) {
         next(error);
@@ -2213,7 +2246,8 @@ const createOrderChain = async (req, res, next) => {
         const {
             client_name, order_type, no_of_links, notes,
             manual_order_id, client_website, fc, order_package, category,
-            target_stage, websites, content_data, assigned_writer_id
+            target_stage, websites, content_data, assigned_writer_id,
+            send_email: sendEmailFlag = true
         } = req.body;
 
         if (!client_name) {
@@ -2276,6 +2310,29 @@ const createOrderChain = async (req, res, next) => {
                     w.upfront_payment ? 1 : 0, w.paypal_id || '', 0, vendorId,
                     target_stage === 'writer' ? 3 : 5, w.option_type || 'insert']
             );
+        }
+
+        // Send email notifications if pushing to bloggers and toggle is ON
+        if (target_stage === 'blogger' && sendEmailFlag) {
+            try {
+                const grouped = {};
+                for (const w of websites) {
+                    const siteResult = await query('SELECT uploaded_user_id, root_domain FROM new_sites WHERE id = $1', [w.id]);
+                    const vendorId = siteResult.rows[0]?.uploaded_user_id;
+                    if (!vendorId) continue;
+                    if (!grouped[vendorId]) {
+                        const userResult = await query('SELECT name, email FROM users WHERE id = $1', [vendorId]);
+                        grouped[vendorId] = { email: userResult.rows[0]?.email, name: userResult.rows[0]?.name, tasks: [] };
+                    }
+                    grouped[vendorId].tasks.push({ root_domain: siteResult.rows[0]?.root_domain, order_id: orderId });
+                }
+                for (const vendorId of Object.keys(grouped)) {
+                    const g = grouped[vendorId];
+                    if (g.email) sendOrderAssignedEmail(g.email, g.name, g.tasks);
+                }
+            } catch (emailErr) {
+                console.error('CreateOrderChain email failed (non-blocking):', emailErr.message);
+            }
         }
 
         res.status(201).json({ message: `Order created and pushed to ${target_stage}`, order: { id: order.id, order_id: orderId } });

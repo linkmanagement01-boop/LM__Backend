@@ -1,6 +1,7 @@
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const { query, transaction } = require('../config/database');
+const { sendPaymentApprovedEmail } = require('./emailService');
 
 /**
  * Wallet Service - Production Database Compatible
@@ -231,6 +232,17 @@ const processWithdrawalApproval = async (transactionId, managerId) => {
 
             return approveResult.rows[0];
         });
+
+        // Send email notification to blogger
+        try {
+            const userResult = await query('SELECT email, name FROM users WHERE id = $1', [txn.user_id]);
+            if (userResult.rows.length > 0) {
+                const user = userResult.rows[0];
+                sendPaymentApprovedEmail(user.email, user.name, txn.amount, 'Approved by Accountant');
+            }
+        } catch (emailErr) {
+            console.error('Accountant payment approved email failed (non-blocking):', emailErr.message);
+        }
 
         return {
             ...result,

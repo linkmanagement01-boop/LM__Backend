@@ -6,6 +6,7 @@ const User = require('../models/User');
 const Website = require('../models/Website');
 const { getAvailableBalance, getUnapprovedCreditsBalance } = require('../utils/walletService');
 const { query } = require('../config/database');
+const { sendSiteAddedEmail } = require('../utils/emailService');
 
 /**
  * Blogger Controller - Production Database Compatible
@@ -783,6 +784,14 @@ const addSite = async (req, res, next) => {
         );
 
         const site = result.rows[0];
+
+        // Send email notification to the blogger
+        try {
+            sendSiteAddedEmail(req.user.email, req.user.name, domainToUse);
+        } catch (emailErr) {
+            console.error('Site added email failed (non-blocking):', emailErr.message);
+        }
+
         res.status(201).json({
             message: 'Site added successfully',
             site: {
