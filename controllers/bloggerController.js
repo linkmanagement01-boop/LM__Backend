@@ -2030,6 +2030,7 @@ const downloadInvoicePdf = async (req, res, next) => {
                                 THEN REGEXP_REPLACE(ns.gp_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
                             ELSE 0 END
                 END as price,
+                wh.remarks,
                 nopd.submit_url, 
                 ns.root_domain, 
                 no.order_id as manual_order_id
@@ -2045,8 +2046,15 @@ const downloadInvoicePdf = async (req, res, next) => {
         const totalAmount = itemsResult.rows.reduce((sum, row) => sum + parseFloat(row.price || 0), 0);
         const invNum = wr.invoice_pre ? `${wr.invoice_pre}${wr.invoice_number}` : (wr.invoice_number || (100000 + parseInt(id)));
 
+        // Extract remarks dynamically (matching getInvoiceDetail logic)
+        let invoiceNote = 'Thank you for your business!';
+        const validRemarkObj = itemsResult.rows.find(row => row.remarks && row.remarks.trim() !== '');
+        if (validRemarkObj) {
+            invoiceNote = validRemarkObj.remarks.trim();
+        }
+
         // Create PDF
-        const doc = new PDFDocument({ margin: 50 });
+        const doc = new PDFDocument({ margin: 50, bufferPages: true });
         const filename = `invoice-LM${invNum}.pdf`;
 
         res.setHeader('Content-Type', 'application/pdf');
@@ -2074,10 +2082,10 @@ const downloadInvoicePdf = async (req, res, next) => {
         doc.fontSize(10).font('Helvetica').text(wr.name);
         doc.text(`Email: ${wr.email}`);
         doc.text(`Country: ${wr.country_name || 'N/A'}`);
-        doc.moveDown();
+        doc.moveDown(2);
 
-        // Items Table Header
-        const tableTop = 300;
+        // Items Table Header - use current Y position instead of hardcoded 300
+        const tableTop = doc.y;
         doc.fontSize(10).font('Helvetica-Bold');
         doc.text('Service/Link', 50, tableTop);
         doc.text('Order ID', 350, tableTop);
@@ -2085,10 +2093,17 @@ const downloadInvoicePdf = async (req, res, next) => {
 
         doc.moveTo(50, tableTop + 15).lineTo(550, tableTop + 15).stroke();
 
-        // Items
+        // Items - with page break handling
         let y = tableTop + 25;
+        const pageHeight = doc.page.height - doc.page.margins.bottom;
         doc.font('Helvetica');
         itemsResult.rows.forEach(item => {
+            // Check if we need a new page
+            if (y > pageHeight - 60) {
+                doc.addPage();
+                y = doc.page.margins.top;
+            }
+
             const price = `$${parseFloat(item.price || 0).toFixed(2)}`;
             const link = item.submit_url || item.root_domain || 'N/A';
             const orderId = item.manual_order_id || 'N/A';
@@ -2107,8 +2122,13 @@ const downloadInvoicePdf = async (req, res, next) => {
         doc.text('Total', 350, y);
         doc.text(`$${totalAmount.toFixed(2)}`, 480, y, { align: 'right' });
 
-        // Footer
-        doc.fontSize(10).font('Helvetica-Oblique').text('Thank you for your business!', 50, 700, { align: 'center' });
+        // Remarks / Note - use relative positioning instead of absolute Y=700
+        doc.y = y + 40;
+        doc.fontSize(10).font('Helvetica-Bold').text('Remarks:', 50);
+        doc.fontSize(10).font('Helvetica').text(invoiceNote, 50, undefined, { width: 500 });
+
+        doc.moveDown(2);
+        doc.fontSize(10).font('Helvetica-Oblique').text('Thank you for your business!', { align: 'center' });
 
         doc.end();
     } catch (error) {

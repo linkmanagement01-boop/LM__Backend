@@ -30,6 +30,7 @@ router.get('/wallet/withdrawal-requests', ...walletAuth, adminController.getWith
 router.get('/wallet/withdrawal-requests/:id', ...walletAuth, adminController.getWithdrawalRequestDetail);
 router.put('/wallet/withdrawal-requests/:id/approve', ...walletAuth, adminController.approveWithdrawal);
 router.put('/wallet/withdrawal-requests/:id/reject', ...walletAuth, adminController.rejectWithdrawal);
+router.get('/wallet/invoices/bulk-pdf', ...walletAuth, adminController.downloadBulkInvoicesPdf);
 router.get('/wallet/invoices/:id', ...walletAuth, adminController.getInvoiceDetail);
 router.get('/wallet/invoices/:id/pdf', ...walletAuth, adminController.downloadInvoicePdf);
 router.post('/wallet/recalculate/:userId', ...walletAuth, adminController.recalculateWallet);

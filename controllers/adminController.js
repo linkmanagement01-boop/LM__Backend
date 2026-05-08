@@ -3389,6 +3389,7 @@ const downloadInvoicePdf = async (req, res, next) => {
                     WHEN ns.gp_price ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.gp_price::DOUBLE PRECISION
                     ELSE 0
                 END as price,
+                wh.remarks,
                 nopd.submit_url, 
                 ns.root_domain, 
                 no.order_id as manual_order_id
@@ -3404,8 +3405,15 @@ const downloadInvoicePdf = async (req, res, next) => {
         const totalAmount = itemsResult.rows.reduce((sum, row) => sum + parseFloat(row.price || 0), 0);
         const invNum = wr.invoice_pre ? `${wr.invoice_pre}${wr.invoice_number}` : (wr.invoice_number || (100000 + parseInt(id)));
 
-        // Create PDF
-        const doc = new PDFDocument({ margin: 50 });
+        // Extract remarks dynamically (matching getInvoiceDetail logic)
+        let invoiceNote = 'Thank you for your business!';
+        const validRemarkObj = itemsResult.rows.find(row => row.remarks && row.remarks.trim() !== '');
+        if (validRemarkObj) {
+            invoiceNote = validRemarkObj.remarks.trim();
+        }
+
+        // Create PDF - use autoFirstPage: true (default) with proper margins
+        const doc = new PDFDocument({ margin: 50, bufferPages: true });
         const filename = `invoice-LM${invNum}.pdf`;
 
         res.setHeader('Content-Type', 'application/pdf');
@@ -3433,10 +3441,10 @@ const downloadInvoicePdf = async (req, res, next) => {
         doc.fontSize(10).font('Helvetica').text(wr.name);
         doc.text(`Email: ${wr.email}`);
         doc.text(`Country: ${wr.country_name || 'N/A'}`);
-        doc.moveDown();
+        doc.moveDown(2);
 
-        // Items Table Header
-        const tableTop = 300;
+        // Items Table Header - use current Y position instead of hardcoded 300
+        const tableTop = doc.y;
         doc.fontSize(10).font('Helvetica-Bold');
         doc.text('Service/Link', 50, tableTop);
         doc.text('Order ID', 350, tableTop);
@@ -3444,10 +3452,17 @@ const downloadInvoicePdf = async (req, res, next) => {
 
         doc.moveTo(50, tableTop + 15).lineTo(550, tableTop + 15).stroke();
 
-        // Items
+        // Items - with page break handling
         let y = tableTop + 25;
+        const pageHeight = doc.page.height - doc.page.margins.bottom;
         doc.font('Helvetica');
         itemsResult.rows.forEach(item => {
+            // Check if we need a new page
+            if (y > pageHeight - 60) {
+                doc.addPage();
+                y = doc.page.margins.top;
+            }
+
             const price = `$${parseFloat(item.price || 0).toFixed(2)}`;
             const link = item.submit_url || item.root_domain || 'N/A';
             const orderId = item.manual_order_id || 'N/A';
@@ -3466,12 +3481,188 @@ const downloadInvoicePdf = async (req, res, next) => {
         doc.text('Total', 350, y);
         doc.text(`$${totalAmount.toFixed(2)}`, 480, y, { align: 'right' });
 
-        // Footer
-        doc.fontSize(10).font('Helvetica-Oblique').text('Thank you for your business!', 50, 700, { align: 'center' });
+        // Remarks / Note - use relative positioning instead of absolute Y=700
+        doc.y = y + 40;
+        doc.fontSize(10).font('Helvetica-Bold').text('Remarks:', 50);
+        doc.fontSize(10).font('Helvetica').text(invoiceNote, 50, undefined, { width: 500 });
+
+        doc.moveDown(2);
+        doc.fontSize(10).font('Helvetica-Oblique').text('Thank you for your business!', { align: 'center' });
 
         doc.end();
     } catch (error) {
         console.error('PDF Error:', error);
+        if (!res.headersSent) {
+            next(error);
+        }
+    }
+};
+
+/**
+ * @route   GET /api/admin/wallet/invoices/bulk-pdf
+ * @desc    Download multiple invoices as a single PDF based on date filter
+ * @access  Admin/Accountant
+ */
+const downloadBulkInvoicesPdf = async (req, res, next) => {
+    try {
+        const { filter_start_date, filter_end_date } = req.query;
+
+        if (!filter_start_date || !filter_end_date) {
+            return res.status(400).json({ error: 'Start date and end date are required' });
+        }
+
+        // Fetch all withdrawal requests matching the clearance date filter
+        const requestsResult = await query(
+            `SELECT 
+                wr.id, wr.invoice_number, wr.invoice_pre, wr.created_at, wr.updated_at,
+                u.name as user_name, u.email as user_email, u.whatsapp as phone,
+                cl.name as country_name
+             FROM withdraw_requests wr
+             JOIN users u ON wr.user_id = u.id
+             LEFT JOIN countries cl ON u.country_id = cl.id
+             LEFT JOIN wallet_histories wh ON wh.withdraw_request_id = wr.id
+             WHERE wr.status = 1
+             GROUP BY wr.id, u.id, cl.id
+             HAVING DATE(MAX(wh.approved_date)) >= $1::date AND DATE(MAX(wh.approved_date)) <= $2::date
+             ORDER BY MAX(wh.approved_date) ASC`,
+            [filter_start_date, filter_end_date]
+        );
+
+        if (requestsResult.rows.length === 0) {
+            return res.status(404).json({ error: 'No invoices found for the specified date range' });
+        }
+
+        const requests = requestsResult.rows;
+
+        // Initialize PDF
+        const doc = new PDFDocument({ margin: 50, bufferPages: true });
+        const filename = `bulk-invoices-${filter_start_date}-to-${filter_end_date}.pdf`;
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+        doc.pipe(res);
+
+        // Process each invoice
+        for (let i = 0; i < requests.length; i++) {
+            const wr = requests[i];
+
+            const itemsResult = await query(
+                `SELECT 
+                    CASE 
+                        WHEN LOWER(no.order_type) LIKE '%niche%' OR LOWER(no.order_type) LIKE '%edit%' OR LOWER(no.order_type) LIKE '%insertion%'
+                            THEN CASE 
+                                WHEN no.fc = 1 AND ns.fc_ne IS NOT NULL AND REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$' AND REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION > 0
+                                    THEN REGEXP_REPLACE(ns.fc_ne::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                                WHEN REGEXP_REPLACE(COALESCE(ns.niche_edit_price::text,'0'), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$'
+                                    THEN REGEXP_REPLACE(ns.niche_edit_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                                ELSE 0 END
+                        ELSE CASE 
+                                WHEN no.fc = 1 AND ns.fc_gp IS NOT NULL AND REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$' AND REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION > 0
+                                    THEN REGEXP_REPLACE(ns.fc_gp::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                                WHEN REGEXP_REPLACE(COALESCE(ns.gp_price::text,'0'), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]+)?$'
+                                    THEN REGEXP_REPLACE(ns.gp_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
+                                ELSE 0 END
+                    END as price,
+                    wh.remarks,
+                    nopd.submit_url, 
+                    ns.root_domain, 
+                    no.order_id as manual_order_id
+                 FROM wallet_histories wh
+                 LEFT JOIN new_order_process_details nopd ON wh.order_detail_id = nopd.id
+                 LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
+                 LEFT JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+                 LEFT JOIN new_orders no ON nop.new_order_id = no.id
+                 WHERE wh.withdraw_request_id = $1
+                 ORDER BY wh.created_at DESC`,
+                [wr.id]
+            );
+
+            const totalAmount = itemsResult.rows.reduce((sum, row) => sum + parseFloat(row.price || 0), 0);
+            const invNum = wr.invoice_pre ? `${wr.invoice_pre}${wr.invoice_number}` : (wr.invoice_number || (100000 + parseInt(wr.id)));
+
+            let invoiceNote = 'Thank you for your business!';
+            const validRemarkObj = itemsResult.rows.find(row => row.remarks && row.remarks.trim() !== '');
+            if (validRemarkObj) {
+                invoiceNote = validRemarkObj.remarks.trim();
+            }
+
+            // Header
+            doc.fontSize(20).text('INVOICE', { align: 'right' });
+            doc.fontSize(10).text(`Invoice #: LM${invNum}`, { align: 'right' });
+            doc.text(`Date: ${new Date(wr.created_at).toLocaleDateString()}`, { align: 'right' });
+            doc.moveDown();
+
+            // Bill From (Company)
+            doc.fontSize(12).font('Helvetica-Bold').text('Bill From:');
+            doc.fontSize(10).font('Helvetica').text('RankMeup Services');
+            doc.text('# SCO 105 3rd Floor Ranjit Avenue B Block Amritsar');
+            doc.text('Punjab, India 143001');
+            doc.text('Email:- contact@rankmeup.in');
+            doc.text('Phone no = 7087825869');
+            doc.moveDown();
+
+            // Bill To (Blogger)
+            doc.fontSize(12).font('Helvetica-Bold').text('Bill To:');
+            doc.fontSize(10).font('Helvetica').text(wr.user_name || 'N/A');
+            doc.text(`Email: ${wr.user_email || 'N/A'}`);
+            doc.text(`Country: ${wr.country_name || 'N/A'}`);
+            doc.moveDown(2);
+
+            // Items Table Header
+            const tableTop = doc.y;
+            doc.fontSize(10).font('Helvetica-Bold');
+            doc.text('Service/Link', 50, tableTop);
+            doc.text('Order ID', 350, tableTop);
+            doc.text('Amount', 480, tableTop, { align: 'right' });
+
+            doc.moveTo(50, tableTop + 15).lineTo(550, tableTop + 15).stroke();
+
+            // Items - with page break handling
+            let y = tableTop + 25;
+            const pageHeight = doc.page.height - doc.page.margins.bottom;
+            doc.font('Helvetica');
+            itemsResult.rows.forEach(item => {
+                if (y > pageHeight - 60) {
+                    doc.addPage();
+                    y = doc.page.margins.top;
+                }
+
+                const price = `$${parseFloat(item.price || 0).toFixed(2)}`;
+                const link = item.submit_url || item.root_domain || 'N/A';
+                const orderId = item.manual_order_id || 'N/A';
+
+                doc.text(link.substring(0, 50), 50, y);
+                doc.text(orderId, 350, y);
+                doc.text(price, 480, y, { align: 'right' });
+                y += 20;
+            });
+
+            doc.moveTo(50, y).lineTo(550, y).stroke();
+            y += 10;
+
+            // Total
+            doc.fontSize(12).font('Helvetica-Bold');
+            doc.text('Total', 350, y);
+            doc.text(`$${totalAmount.toFixed(2)}`, 480, y, { align: 'right' });
+
+            // Remarks / Note
+            doc.y = y + 40;
+            doc.fontSize(10).font('Helvetica-Bold').text('Remarks:', 50);
+            doc.fontSize(10).font('Helvetica').text(invoiceNote, 50, undefined, { width: 500 });
+
+            doc.moveDown(2);
+            doc.fontSize(10).font('Helvetica-Oblique').text('Thank you for your business!', { align: 'center' });
+
+            // Add new page for next invoice, except for the last one
+            if (i < requests.length - 1) {
+                doc.addPage();
+            }
+        }
+
+        doc.end();
+    } catch (error) {
+        console.error('Bulk PDF Error:', error);
         if (!res.headersSent) {
             next(error);
         }
@@ -4030,6 +4221,7 @@ module.exports = {
     // Invoice Management
     getInvoiceDetail,
     downloadInvoicePdf,
+    downloadBulkInvoicesPdf,
     // User Management Extended
     resetUserPassword,
     changeUserPassword,
