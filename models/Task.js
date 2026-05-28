@@ -128,6 +128,10 @@ class Task {
             paramIndex++;
         }
 
+        if (filters.exclude_client_orders) {
+            sql += ` AND o.order_id NOT LIKE 'CLT-%'`;
+        }
+
         if (filters.assigned_team_id) {
             sql += ` AND o.team_id = $${paramIndex}`;
             params.push(filters.assigned_team_id);
@@ -272,6 +276,8 @@ class Task {
             option_type: row.type || 'insert', // Map DB 'type' to 'option_type'
             replace_with: row.insert_after,    // Reuse column for replace_with
             replace_statement: row.statement,   // Reuse column for replace_statement
+            status: Number(row.status),
+            fill_details: row.fill_details || false,
             is_rejected: Number(row.status) === 11 // Pass the rejected status natively, type-safe
         }));
 

@@ -21,6 +21,7 @@ const ROLE_MAP = {
     'Writer': 'writer',
     'Blogger': 'vendor',  // Production uses 'vendor' for bloggers
     'Accountant': 'accountant',
+    'Client': 'client',
     'SuperAdmin': 'super_admin'
 };
 
@@ -31,6 +32,7 @@ const ROLE_MAP_REVERSE = {
     'writer': 'Writer',
     'vendor': 'Blogger',
     'accountant': 'Accountant',
+    'client': 'Client',
     'super_admin': 'SuperAdmin'
 };
 

@@ -6,6 +6,7 @@ const fs = require('fs');
 const adminController = require('../controllers/adminController');
 const adminSitesController = require('../controllers/adminSitesController');
 const managerController = require('../controllers/managerController');
+const adminReportController = require('../controllers/adminReportController');
 const { authenticate, authorize } = require('../middleware/auth');
 
 // Ensure profile upload directory exists
@@ -30,7 +31,6 @@ router.get('/wallet/withdrawal-requests', ...walletAuth, adminController.getWith
 router.get('/wallet/withdrawal-requests/:id', ...walletAuth, adminController.getWithdrawalRequestDetail);
 router.put('/wallet/withdrawal-requests/:id/approve', ...walletAuth, adminController.approveWithdrawal);
 router.put('/wallet/withdrawal-requests/:id/reject', ...walletAuth, adminController.rejectWithdrawal);
-router.get('/wallet/invoices/bulk-pdf', ...walletAuth, adminController.downloadBulkInvoicesPdf);
 router.get('/wallet/invoices/:id', ...walletAuth, adminController.getInvoiceDetail);
 router.get('/wallet/invoices/:id/pdf', ...walletAuth, adminController.downloadInvoicePdf);
 router.post('/wallet/recalculate/:userId', ...walletAuth, adminController.recalculateWallet);
@@ -38,8 +38,13 @@ router.post('/wallet/recalculate/:userId', ...walletAuth, adminController.recalc
 // All other routes require securely strict Admin role
 router.use(authenticate, authorize('Admin'));
 
+// ==================== FINANCIAL REPORTS ====================
+router.get('/reports/financial', adminReportController.getFinancialReport);
+
 // ==================== ORDERS MANAGEMENT (reuse manager functions) ====================
 router.get('/orders', managerController.getOrders);
+router.get('/client-orders', managerController.getClientOrders);
+router.put('/client-orders/:id/reassign', managerController.reassignClientOrder);
 router.get('/orders/:id/details', managerController.getOrderDetails);
 router.patch('/orders/:id', managerController.updateOrder);
 router.get('/rejected-orders', managerController.getRejectedOrders);
@@ -55,6 +60,10 @@ router.put('/users/:id/change-password', adminController.changeUserPassword);
 router.get('/users/:id/permissions', adminController.getUserPermissions);
 router.put('/users/:id/permissions', adminController.updateUserPermissions);
 router.post('/users/:id/impersonate', adminController.impersonateUser);
+
+// ==================== CLIENT WALLET MANAGEMENT ====================
+router.post('/users/:id/wallet/add', adminController.addManualWalletBalance);
+router.post('/users/:id/wallet/withdraw', adminController.withdrawManualWalletBalance);
 
 // ==================== BLOGGER PERFORMANCE ====================
 router.get('/bloggers/:id/performance', adminController.getBloggerPerformance);

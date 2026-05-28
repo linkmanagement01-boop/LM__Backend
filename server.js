@@ -23,6 +23,7 @@ const accountantRoutes = require('./routes/accountant');
 const configRoutes = require('./routes/config');
 const threadRoutes = require('./routes/threads');
 const chatRoutes = require('./routes/chat');
+const clientRoutes = require('./routes/client');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -225,6 +226,7 @@ app.use('/api/accountant', accountantRoutes);
 app.use('/api/config', configRoutes);
 app.use('/api/threads', threadRoutes);
 app.use('/api/chat', chatRoutes);
+app.use('/api/client', clientRoutes);
 
 // 404 handler
 app.use((req, res) => {

@@ -37,7 +37,8 @@ const getDashboardStats = async (req, res, next) => {
              JOIN new_orders o ON nop.new_order_id = o.id
              WHERE nopd.status = 7 
                AND nopd.submit_url IS NOT NULL
-               AND o.new_order_status < 5`
+               AND o.new_order_status < 5
+               AND o.order_id NOT LIKE 'CLT-%'`
         );
 
         // Pending Approvals Teams: BOTH order and process status must be 2
@@ -53,7 +54,8 @@ const getDashboardStats = async (req, res, next) => {
              ) nop ON true
              WHERE o.new_order_status = 2 
                AND nop.status = 2
-               AND o.manager_id = $1`,
+               AND o.manager_id = $1
+               AND o.order_id NOT LIKE 'CLT-%'`,
             [managerId]
         );
 
@@ -70,15 +72,19 @@ const getDashboardStats = async (req, res, next) => {
              ) nop ON true
              WHERE o.new_order_status = 4 
                AND nop.status = 4
-               AND o.manager_id = $1`,
+               AND o.manager_id = $1
+               AND o.order_id NOT LIKE 'CLT-%'`,
             [managerId]
         );
 
         // Rejected Orders Bloggers (status 11 = Rejected OR has reject_reason)
         // Matches the logic in getRejectedOrders to show exact true count of all rejections
         const rejectedOrdersResult = await query(
-            `SELECT COUNT(*) as count FROM new_order_process_details 
-             WHERE status = 11 OR (reject_reason IS NOT NULL AND TRIM(reject_reason) != '')`
+            `SELECT COUNT(*) as count FROM new_order_process_details nopd
+             JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+             JOIN new_orders o ON nop.new_order_id = o.id
+             WHERE (nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != ''))
+               AND o.order_id NOT LIKE 'CLT-%'`
         );
 
         // Threads count
@@ -105,6 +111,7 @@ const getDashboardStats = async (req, res, next) => {
              WHERE nopd.status = 7
                AND nopd.submit_url IS NOT NULL
                AND o.new_order_status < 5
+               AND o.order_id NOT LIKE 'CLT-%'
              ORDER BY nopd.created_at DESC
              LIMIT 50`
         );
@@ -135,7 +142,7 @@ const getTasks = async (req, res, next) => {
     try {
         const { current_status, status } = req.query;
 
-        const filters = {};
+        const filters = { exclude_client_orders: true };
         // Support both 'current_status' (used by frontend) and 'status' (legacy)
         if (current_status) filters.current_status = current_status;
         else if (status) filters.current_status = status;
@@ -161,54 +168,207 @@ const getOrders = async (req, res, next) => {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 50;
         const offset = (page - 1) * limit;
-        const { status, search } = req.query;
+        const { status, search, client_name, client_website, category, order_id, manager_id, ordered_at_from, ordered_at_to } = req.query;
 
-        // Get total count
-        let countQuery = `SELECT COUNT(*) as total FROM new_orders`;
-        const countResult = await query(countQuery);
-        const total = parseInt(countResult.rows[0]?.total || 0);
+        let whereClauses = [];
+        let params = [];
+        let paramIndex = 1;
 
-        // Get orders with manager name joined
-        let ordersQuery = `
-            SELECT 
-                o.id,
-                o.order_id,
-                o.client_name,
-                COALESCE(
-                    NULLIF(o.client_website, ''),
-                    (SELECT ns.root_domain FROM new_order_process_details nopd 
-                     JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id 
-                     JOIN new_sites ns ON nopd.new_site_id = ns.id 
-                     WHERE nop.new_order_id = o.id LIMIT 1)
-                ) as client_website,
-                o.no_of_links,
-                o.order_type,
-                o.order_package,
-                o.message,
-                o.category,
-                o.new_order_status as status,
-                CASE 
-                    WHEN o.new_order_status = 1 THEN 'Pending'
-                    WHEN o.new_order_status = 2 THEN 'In Progress'
-                    WHEN o.new_order_status = 3 THEN 'With Writer'
-                    WHEN o.new_order_status = 4 THEN 'With Blogger'
-                    WHEN o.new_order_status = 5 THEN 'Completed'
-                    WHEN o.new_order_status = 6 THEN 'Rejected'
-                    ELSE 'Unknown'
-                END as status_label,
-                o.completed_tasks,
-                o.team_id,
-                m.name as manager_name,
-                m.email as manager_email,
-                o.created_at,
-                o.updated_at
-            FROM new_orders o
-            LEFT JOIN users m ON o.manager_id = m.id
-            ORDER BY o.id DESC
-            LIMIT $1 OFFSET $2
+        if (status) {
+            whereClauses.push(`status_label ILIKE $${paramIndex}`);
+            params.push(status);
+            paramIndex++;
+        }
+
+        if (search) {
+            whereClauses.push(`(order_id ILIKE $${paramIndex} OR client_name ILIKE $${paramIndex} OR manager_name ILIKE $${paramIndex} OR client_website ILIKE $${paramIndex})`);
+            params.push(`%${search}%`);
+            paramIndex++;
+        }
+
+        if (client_name) {
+            whereClauses.push(`client_name ILIKE $${paramIndex}`);
+            params.push(`%${client_name}%`);
+            paramIndex++;
+        }
+
+        if (client_website) {
+            whereClauses.push(`client_website ILIKE $${paramIndex}`);
+            params.push(`%${client_website}%`);
+            paramIndex++;
+        }
+
+        if (category) {
+            whereClauses.push(`category ILIKE $${paramIndex}`);
+            params.push(`%${category}%`);
+            paramIndex++;
+        }
+
+        if (order_id) {
+            whereClauses.push(`order_id ILIKE $${paramIndex}`);
+            params.push(`%${order_id}%`);
+            paramIndex++;
+        }
+
+        if (manager_id) {
+            if (manager_id === 'unassigned') {
+                whereClauses.push(`manager_id IS NULL`);
+            } else {
+                whereClauses.push(`manager_id = $${paramIndex}`);
+                params.push(parseInt(manager_id));
+                paramIndex++;
+            }
+        }
+
+        if (ordered_at_from) {
+            whereClauses.push(`created_at >= $${paramIndex}`);
+            params.push(new Date(ordered_at_from));
+            paramIndex++;
+        }
+
+        if (ordered_at_to) {
+            const endDate = new Date(ordered_at_to);
+            endDate.setDate(endDate.getDate() + 1);
+            whereClauses.push(`created_at < $${paramIndex}`);
+            params.push(endDate);
+            paramIndex++;
+        }
+
+        const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+        // Get total count using CTE
+        const countQuery = `
+            WITH combined_orders AS (
+                SELECT 
+                    o.order_id::varchar,
+                    o.client_name::varchar,
+                    COALESCE(
+                        NULLIF(o.client_website, ''),
+                        (SELECT ns.root_domain FROM new_order_process_details nopd 
+                         JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id 
+                         JOIN new_sites ns ON nopd.new_site_id = ns.id 
+                         WHERE nop.new_order_id = o.id LIMIT 1)
+                    )::varchar as client_website,
+                    o.category::text,
+                    o.manager_id::integer,
+                    m.name::varchar as manager_name,
+                    CASE 
+                        WHEN o.new_order_status = 1 THEN 'Pending'
+                        WHEN o.new_order_status = 2 THEN 'In Progress'
+                        WHEN o.new_order_status = 3 THEN 'With Writer'
+                        WHEN o.new_order_status = 4 THEN 'With Blogger'
+                        WHEN o.new_order_status = 5 THEN 'Completed'
+                        WHEN o.new_order_status = 6 THEN 'Rejected'
+                        ELSE 'Unknown'
+                    END::varchar as status_label,
+                    o.created_at
+                FROM new_orders o
+                LEFT JOIN users m ON o.manager_id = m.id
+
+                UNION ALL
+
+                SELECT 
+                    ('CLT-PRV-' || co.id)::varchar as order_id,
+                    u.name::varchar as client_name,
+                    (SELECT ns.root_domain FROM client_order_details cod LEFT JOIN new_sites ns ON ns.id = cod.site_id WHERE cod.client_order_id = co.id LIMIT 1)::varchar as client_website,
+                    co.category::text,
+                    co.assigned_to::integer as manager_id,
+                    am.name::varchar as manager_name,
+                    CASE 
+                        WHEN co.status = 'pending_review' THEN 'Pending'
+                        WHEN co.status = 'rejected' THEN 'Rejected'
+                        ELSE co.status
+                    END::varchar as status_label,
+                    co.created_at
+                FROM client_orders co
+                LEFT JOIN users u ON u.id = co.client_user_id
+                LEFT JOIN users am ON am.id = co.assigned_to
+                WHERE co.linked_new_order_id IS NULL
+            )
+            SELECT COUNT(*) as total FROM combined_orders ${whereSql}
         `;
 
-        const ordersResult = await query(ordersQuery, [limit, offset]);
+        const countResult = await query(countQuery, params);
+        const total = parseInt(countResult.rows[0]?.total || 0);
+
+        // Fetch paginated combined orders
+        const ordersQuery = `
+            WITH combined_orders AS (
+                SELECT 
+                    ('M-' || o.id)::text as id,
+                    o.order_id::varchar,
+                    o.client_name::varchar,
+                    COALESCE(
+                        NULLIF(o.client_website, ''),
+                        (SELECT ns.root_domain FROM new_order_process_details nopd 
+                         JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id 
+                         JOIN new_sites ns ON nopd.new_site_id = ns.id 
+                         WHERE nop.new_order_id = o.id LIMIT 1)
+                    )::varchar as client_website,
+                    o.no_of_links::varchar,
+                    o.order_type::varchar,
+                    o.order_package::varchar,
+                    o.message::text,
+                    o.category::text,
+                    o.new_order_status::integer as status,
+                    CASE 
+                        WHEN o.new_order_status = 1 THEN 'Pending'
+                        WHEN o.new_order_status = 2 THEN 'In Progress'
+                        WHEN o.new_order_status = 3 THEN 'With Writer'
+                        WHEN o.new_order_status = 4 THEN 'With Blogger'
+                        WHEN o.new_order_status = 5 THEN 'Completed'
+                        WHEN o.new_order_status = 6 THEN 'Rejected'
+                        ELSE 'Unknown'
+                    END::varchar as status_label,
+                    o.completed_tasks::double precision,
+                    o.team_id::integer,
+                    o.manager_id::integer,
+                    m.name::varchar as manager_name,
+                    m.email::varchar as manager_email,
+                    o.created_at,
+                    o.updated_at,
+                    false as is_unapproved_client_order
+                FROM new_orders o
+                LEFT JOIN users m ON o.manager_id = m.id
+
+                UNION ALL
+
+                SELECT 
+                    ('C-' || co.id)::text as id,
+                    ('CLT-PRV-' || co.id)::varchar as order_id,
+                    u.name::varchar as client_name,
+                    (SELECT ns.root_domain FROM client_order_details cod LEFT JOIN new_sites ns ON ns.id = cod.site_id WHERE cod.client_order_id = co.id LIMIT 1)::varchar as client_website,
+                    co.no_of_links::varchar,
+                    co.order_type::varchar,
+                    co.order_package::varchar,
+                    co.notes::text as message,
+                    co.category::text,
+                    1::integer as status,
+                    CASE 
+                        WHEN co.status = 'pending_review' THEN 'Pending'
+                        WHEN co.status = 'rejected' THEN 'Rejected'
+                        ELSE co.status
+                    END::varchar as status_label,
+                    0::double precision as completed_tasks,
+                    0::integer as team_id,
+                    co.assigned_to::integer as manager_id,
+                    am.name::varchar as manager_name,
+                    am.email::varchar as manager_email,
+                    co.created_at,
+                    co.updated_at,
+                    true as is_unapproved_client_order
+                FROM client_orders co
+                LEFT JOIN users u ON u.id = co.client_user_id
+                LEFT JOIN users am ON am.id = co.assigned_to
+                WHERE co.linked_new_order_id IS NULL
+            )
+            SELECT * FROM combined_orders
+            ${whereSql}
+            ORDER BY created_at DESC
+            LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+        `;
+
+        const ordersResult = await query(ordersQuery, [...params, limit, offset]);
 
         res.json({
             total,
@@ -368,6 +528,7 @@ const getPendingFromBloggers = async (req, res, next) => {
              WHERE nopd.status = 7 
                AND nopd.submit_url IS NOT NULL
                AND no.new_order_status < 5
+               AND no.order_id NOT LIKE 'CLT-%'
              ORDER BY nopd.updated_at DESC`
         );
 
@@ -446,8 +607,11 @@ const getRejectedOrders = async (req, res, next) => {
         // but still had a leftover reject_reason from a previous rejection cycle.
         // NOTE: User requested ALL rejected records (approx 1269), even those resubmitted.
         const countResult = await query(
-            `SELECT COUNT(*) as total FROM new_order_process_details 
-             WHERE status = 11 OR (reject_reason IS NOT NULL AND TRIM(reject_reason) != '')`
+            `SELECT COUNT(*) as total FROM new_order_process_details nopd
+             JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+             JOIN new_orders o ON nop.new_order_id = o.id
+             WHERE (nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != ''))
+               AND o.order_id NOT LIKE 'CLT-%'`
         );
         const total = parseInt(countResult.rows[0]?.total || 0);
 
@@ -471,7 +635,8 @@ const getRejectedOrders = async (req, res, next) => {
              JOIN new_orders o ON nop.new_order_id = o.id
              LEFT JOIN users u ON nopd.vendor_id = u.id
              LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
-             WHERE nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != '')
+             WHERE (nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != ''))
+               AND o.order_id NOT LIKE 'CLT-%'
              ORDER BY nopd.updated_at DESC
              LIMIT $1 OFFSET $2`,
             [limit, offset]
@@ -503,8 +668,10 @@ const getRejectedWriterOrders = async (req, res, next) => {
 
         // Count writer-rejected orders
         const countResult = await query(
-            `SELECT COUNT(*) as total FROM new_order_processes 
-             WHERE status = 11 AND writer_id IS NOT NULL`
+            `SELECT COUNT(*) as total FROM new_order_processes nop
+             JOIN new_orders o ON nop.new_order_id = o.id
+             WHERE nop.status = 11 AND nop.writer_id IS NOT NULL
+               AND o.order_id NOT LIKE 'CLT-%'`
         );
         const total = parseInt(countResult.rows[0]?.total || 0);
 
@@ -527,6 +694,7 @@ const getRejectedWriterOrders = async (req, res, next) => {
              JOIN new_orders o ON nop.new_order_id = o.id
              LEFT JOIN users w ON nop.writer_id = w.id
              WHERE nop.status = 11 AND nop.writer_id IS NOT NULL
+               AND o.order_id NOT LIKE 'CLT-%'
              ORDER BY nop.updated_at DESC
              LIMIT $1 OFFSET $2`,
             [limit, offset]
@@ -552,7 +720,74 @@ const getRejectedWriterOrders = async (req, res, next) => {
  */
 const getOrderDetails = async (req, res, next) => {
     try {
-        const { id } = req.params;
+        let { id } = req.params;
+        let isClientOrder = false;
+        let numericId = id;
+
+        if (typeof id === 'string') {
+            if (id.startsWith('C-')) {
+                isClientOrder = true;
+                numericId = parseInt(id.replace('C-', ''));
+            } else if (id.startsWith('M-')) {
+                isClientOrder = false;
+                numericId = parseInt(id.replace('M-', ''));
+            } else {
+                numericId = parseInt(id);
+            }
+        }
+
+        if (isNaN(numericId)) {
+            return res.status(400).json({ error: 'Invalid order ID' });
+        }
+
+        if (isClientOrder) {
+            const clientOrderRes = await query(
+                `SELECT 
+                    co.id,
+                    u.name as client_name,
+                    (SELECT ns.root_domain FROM client_order_details cod LEFT JOIN new_sites ns ON ns.id = cod.site_id WHERE cod.client_order_id = co.id LIMIT 1) as client_website,
+                    co.no_of_links,
+                    co.order_type,
+                    co.order_package,
+                    co.notes as message,
+                    co.category,
+                    co.created_at,
+                    co.updated_at,
+                    am.name as manager_name,
+                    am.email as manager_email
+                 FROM client_orders co
+                 LEFT JOIN users u ON u.id = co.client_user_id
+                 LEFT JOIN users am ON am.id = co.assigned_to
+                 WHERE co.id = $1`,
+                [numericId]
+            );
+
+            if (clientOrderRes.rows.length === 0) {
+                return res.status(404).json({ error: 'Order not found' });
+            }
+
+            const clientOrder = clientOrderRes.rows[0];
+            return res.json({
+                order: {
+                    id: 'C-' + clientOrder.id,
+                    order_id: 'CLT-PRV-' + clientOrder.id,
+                    client_name: clientOrder.client_name,
+                    client_website: clientOrder.client_website,
+                    no_of_links: clientOrder.no_of_links,
+                    order_type: clientOrder.order_type,
+                    order_package: clientOrder.order_package,
+                    message: clientOrder.message,
+                    category: clientOrder.category,
+                    new_order_status: 1,
+                    current_workflow_status: 'Pending',
+                    created_at: clientOrder.created_at,
+                    updated_at: clientOrder.updated_at,
+                    manager_name: clientOrder.manager_name,
+                    manager_email: clientOrder.manager_email
+                },
+                processes: []
+            });
+        }
 
         // Get order basic info
         const orderResult = await query(
@@ -570,14 +805,29 @@ const getOrderDetails = async (req, res, next) => {
                 o.created_at,
                 o.updated_at,
                 m.name as manager_name,
-                m.email as manager_email
+                m.email as manager_email,
+                CASE 
+                    WHEN o.new_order_status = 1 THEN 'Pending'
+                    WHEN o.new_order_status = 2 THEN 'In Progress'
+                    WHEN o.new_order_status = 3 THEN 'With Writer'
+                    WHEN o.new_order_status = 4 THEN 'With Blogger'
+                    WHEN o.new_order_status = 5 THEN 'Completed'
+                    WHEN o.new_order_status = 6 THEN 'Rejected'
+                    ELSE 'Unknown'
+                END as current_workflow_status
              FROM new_orders o
              LEFT JOIN users m ON o.manager_id = m.id
              WHERE o.id = $1`,
-            [id]
+            [numericId]
         );
 
         if (orderResult.rows.length === 0) {
+            // Fallback: Check if it exists in client_orders
+            const checkClientRes = await query('SELECT id FROM client_orders WHERE id = $1', [numericId]);
+            if (checkClientRes.rows.length > 0) {
+                req.params.id = 'C-' + numericId;
+                return getOrderDetails(req, res, next);
+            }
             return res.status(404).json({ error: 'Order not found' });
         }
 
@@ -1412,7 +1662,8 @@ const getPendingFromTeams = async (req, res, next) => {
     try {
         const orders = await Task.findAll({
             manager_id: req.user.id,
-            current_status: 'PENDING_MANAGER_APPROVAL_1'
+            current_status: 'PENDING_MANAGER_APPROVAL_1',
+            exclude_client_orders: true
         });
 
         res.json({
@@ -1435,7 +1686,8 @@ const getPendingFromWriters = async (req, res, next) => {
         // Both SUBMITTED_TO_MANAGER and PENDING_MANAGER_APPROVAL_2 map to status 4
         const orders = await Task.findAll({
             manager_id: req.user.id,
-            current_status: 'PENDING_MANAGER_APPROVAL_2'
+            current_status: 'PENDING_MANAGER_APPROVAL_2',
+            exclude_client_orders: true
         });
 
         res.json({
@@ -1824,6 +2076,12 @@ VALUES(gen_random_uuid(), 'order_assigned', 'App\\Models\\User', $1, $2, CURRENT
             [id]
         );
 
+        // If this order was linked to a client order, update the client order status to 'pushed_to_blogger'
+        await query(
+            `UPDATE client_orders SET status = 'pushed_to_blogger', updated_at = CURRENT_TIMESTAMP WHERE linked_new_order_id = $1`,
+            [id]
+        );
+
         // Emit socket event for real-time updates
         const io = req.app.get('io');
         if (io) {
@@ -2105,11 +2363,23 @@ const finalizeFromBlogger = async (req, res, next) => {
             );
 
             // Also update the parent order status to complete
-            await query(
-                `UPDATE new_orders SET new_order_status = 5, completed_tasks = completed_tasks + 1, updated_at = CURRENT_TIMESTAMP 
-                 WHERE id = (SELECT new_order_id FROM new_order_processes WHERE id = $1)`,
-                [detail.new_order_process_id]
-            );
+            const parentOrderQuery = `SELECT new_order_id FROM new_order_processes WHERE id = $1`;
+            const parentOrderRes = await query(parentOrderQuery, [detail.new_order_process_id]);
+            const newOrderId = parentOrderRes.rows[0]?.new_order_id;
+
+            if (newOrderId) {
+                await query(
+                    `UPDATE new_orders SET new_order_status = 5, completed_tasks = completed_tasks + 1, updated_at = CURRENT_TIMESTAMP 
+                     WHERE id = $1`,
+                    [newOrderId]
+                );
+
+                // Update the linked client order to 'completed'
+                await query(
+                    `UPDATE client_orders SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE linked_new_order_id = $1`,
+                    [newOrderId]
+                );
+            }
         }
 
         res.json({
@@ -2554,6 +2824,607 @@ const deleteOrder = async (req, res, next) => {
     }
 };
 
+// ==================== CLIENT ORDER MANAGEMENT ====================
+
+/**
+ * @route   GET /api/manager/client-orders
+ * @desc    Get all client orders for manager review
+ * @access  Manager only
+ */
+const getClientOrders = async (req, res, next) => {
+    try {
+        const { page = 1, limit = 20, status, manager_id } = req.query;
+        const offset = (page - 1) * limit;
+
+        let whereClause = 'WHERE 1=1';
+        const params = [];
+        let paramIndex = 1;
+
+        // Restrict to manager's assigned orders if called by a manager
+        const userRole = (req.user.role || '').toLowerCase();
+        if (userRole === 'manager') {
+            whereClause += ` AND co.assigned_to = $${paramIndex}`;
+            params.push(req.user.id);
+            paramIndex++;
+        } else if (manager_id) {
+            if (manager_id === 'unassigned') {
+                whereClause += ` AND co.assigned_to IS NULL`;
+            } else {
+                whereClause += ` AND co.assigned_to = $${paramIndex}`;
+                params.push(manager_id);
+                paramIndex++;
+            }
+        }
+
+        if (status) {
+            if (status === 'pending_review') {
+                whereClause += ` AND co.status = 'pending_review'`;
+            } else if (status === 'sent_to_writer') {
+                whereClause += ` AND co.status = 'sent_to_writer' AND (SELECT nop.status FROM new_order_processes nop WHERE nop.new_order_id = co.linked_new_order_id ORDER BY nop.id DESC LIMIT 1) = 3`;
+            } else if (status === 'writer_approved') {
+                whereClause += ` AND co.status = 'sent_to_writer' AND (SELECT nop.status FROM new_order_processes nop WHERE nop.new_order_id = co.linked_new_order_id ORDER BY nop.id DESC LIMIT 1) = 4`;
+            } else if (status === 'blogger_approved') {
+                whereClause += ` AND (co.status = 'pushed_to_blogger' OR co.status = 'completed' OR (co.status = 'sent_to_writer' AND (SELECT nop.status FROM new_order_processes nop WHERE nop.new_order_id = co.linked_new_order_id ORDER BY nop.id DESC LIMIT 1) = 5))`;
+            } else {
+                whereClause += ` AND co.status = $${paramIndex}`;
+                params.push(status);
+                paramIndex++;
+            }
+        }
+
+        const countResult = await query(
+            `SELECT COUNT(*) as total FROM client_orders co ${whereClause}`,
+            params
+        );
+
+        const ordersResult = await query(
+            `SELECT co.*, 
+                    u.name as client_name, u.name as client_name_user, u.email as client_email,
+                    am.name as assigned_manager_name,
+                    (SELECT ns.root_domain FROM client_order_details cod LEFT JOIN new_sites ns ON ns.id = cod.site_id WHERE cod.client_order_id = co.id LIMIT 1) as client_website,
+                    (SELECT COUNT(*) FROM client_order_details cod WHERE cod.client_order_id = co.id) as site_count,
+                    (SELECT nop.status FROM new_order_processes nop WHERE nop.new_order_id = co.linked_new_order_id ORDER BY nop.id DESC LIMIT 1) as linked_process_status,
+                    (SELECT w.name FROM new_order_processes nop LEFT JOIN users w ON nop.writer_id = w.id WHERE nop.new_order_id = co.linked_new_order_id ORDER BY nop.id DESC LIMIT 1) as assigned_writer_name,
+                    (SELECT COUNT(*) FROM new_order_process_details nopd JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id WHERE nop.new_order_id = co.linked_new_order_id AND nopd.status = 7) as pending_blogger_submissions_count,
+                    (SELECT COUNT(*) FROM new_order_process_details nopd JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id WHERE nop.new_order_id = co.linked_new_order_id AND nopd.status = 8) as completed_blogger_submissions_count
+             FROM client_orders co 
+             LEFT JOIN users u ON u.id = co.client_user_id
+             LEFT JOIN users am ON am.id = co.assigned_to
+             ${whereClause} 
+             ORDER BY co.created_at DESC 
+             LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+            [...params, parseInt(limit), parseInt(offset)]
+        );
+
+        res.json({
+            orders: ordersResult.rows,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: parseInt(countResult.rows[0].total),
+                totalPages: Math.ceil(parseInt(countResult.rows[0].total) / limit)
+            }
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   PUT /api/admin/client-orders/:id/reassign
+ * @desc    Reassign a client order to a new manager
+ * @access  Admin only
+ */
+const reassignClientOrder = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+        const { manager_id } = req.body;
+
+        if (!manager_id) {
+            return res.status(400).json({ error: 'Manager ID is required' });
+        }
+
+        let numericId = id;
+        if (typeof id === 'string') {
+            numericId = parseInt(id.replace('C-', ''));
+        }
+
+        if (isNaN(numericId)) {
+            return res.status(400).json({ error: 'Invalid order ID' });
+        }
+
+        const orderRes = await query('SELECT id FROM client_orders WHERE id = $1', [numericId]);
+        if (orderRes.rows.length === 0) {
+            return res.status(404).json({ error: 'Order not found' });
+        }
+
+        // Validate that the target manager is active and has the correct role
+        const managerRes = await query('SELECT role, status FROM users WHERE id = $1', [manager_id]);
+        if (managerRes.rows.length === 0) {
+            return res.status(404).json({ error: 'Manager not found' });
+        }
+        const manager = managerRes.rows[0];
+        if (!manager.role || manager.role.toLowerCase() !== 'manager' || manager.status !== 1) {
+            return res.status(400).json({ error: 'Selected user is not an active Manager' });
+        }
+
+        await query(
+            'UPDATE client_orders SET assigned_to = $1, assigned_at = CURRENT_TIMESTAMP WHERE id = $2',
+            [manager_id, numericId]
+        );
+
+        res.json({ message: 'Order reassigned successfully' });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   GET /api/manager/client-orders/:id
+ * @desc    Get client order details for manager to review/edit
+ * @access  Manager only
+ */
+const getClientOrderDetails = async (req, res, next) => {
+    try {
+        const orderId = req.params.id;
+
+        const orderResult = await query(
+            `SELECT co.*, u.name as client_name_user, u.email as client_email,
+                    nop.status as linked_process_status,
+                    nop.writer_id as assigned_writer_id,
+                    w.name as assigned_writer_name
+             FROM client_orders co 
+             LEFT JOIN users u ON u.id = co.client_user_id
+             LEFT JOIN new_order_processes nop ON nop.new_order_id = co.linked_new_order_id AND nop.id = (
+                 SELECT id FROM new_order_processes WHERE new_order_id = co.linked_new_order_id ORDER BY id DESC LIMIT 1
+             )
+             LEFT JOIN users w ON w.id = nop.writer_id
+             WHERE co.id = $1`,
+            [orderId]
+        );
+
+        if (orderResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Client order not found' });
+        }
+
+        const detailsResult = await query(
+            `SELECT cod.id, cod.client_order_id, cod.site_id, cod.fill_details,
+                    COALESCE(nopd.url, cod.target_url) as target_url,
+                    COALESCE(nopd.anchor, cod.anchor_text) as anchor_text,
+                    COALESCE(nopd.title, cod.article_title) as article_title,
+                    COALESCE(nopd.doc_urls, cod.doc_url) as doc_url,
+                    COALESCE(nopd.ourl, cod.post_url) as post_url,
+                    COALESCE(nopd.insert_after, cod.insert_after) as insert_after,
+                    COALESCE(nopd.statement, cod.insert_statement) as insert_statement,
+                    COALESCE(nopd.note, cod.note) as note,
+                    nopd.upload_doc_file,
+                    nopd.id as process_detail_id,
+                    nopd.status as process_detail_status,
+                    nopd.submit_url,
+                    nopd.reject_reason as process_detail_reject_reason,
+                    ns.root_domain, ns.da, ns.dr, ns.traffic, ns.gp_price, ns.niche_edit_price, 
+                    ns.category as site_category, ns.uploaded_user_id as vendor_id,
+                    ns.fc_gp, ns.fc_ne, ns.website_status
+             FROM client_order_details cod 
+             LEFT JOIN new_sites ns ON ns.id = cod.site_id 
+             LEFT JOIN client_orders co ON co.id = cod.client_order_id
+             LEFT JOIN new_order_processes nop ON nop.new_order_id = co.linked_new_order_id AND nop.id = (
+                 SELECT id FROM new_order_processes WHERE new_order_id = co.linked_new_order_id ORDER BY id DESC LIMIT 1
+             )
+             LEFT JOIN new_order_process_details nopd ON nopd.new_order_process_id = nop.id AND nopd.new_site_id = cod.site_id
+             WHERE cod.client_order_id = $1 
+             ORDER BY cod.id`,
+            [orderId]
+        );
+
+        res.json({
+            order: orderResult.rows[0],
+            details: detailsResult.rows
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   PUT /api/manager/client-orders/:id
+ * @desc    Update client order details (manager can edit/add details before pushing)
+ * @access  Manager only
+ */
+const updateClientOrder = async (req, res, next) => {
+    try {
+        const orderId = req.params.id;
+        const { manager_notes, details } = req.body;
+
+        // Update manager notes on the order
+        if (manager_notes !== undefined) {
+            await query(
+                `UPDATE client_orders SET manager_notes = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+                [manager_notes, orderId]
+            );
+        }
+
+        // Get client order
+        const orderResult = await query('SELECT linked_new_order_id FROM client_orders WHERE id = $1', [orderId]);
+        const linkedNewOrderId = orderResult.rows[0]?.linked_new_order_id;
+
+        // Update individual site details
+        if (details && Array.isArray(details)) {
+            for (const d of details) {
+                await query(
+                    `UPDATE client_order_details 
+                     SET target_url = COALESCE($1, target_url), 
+                         anchor_text = COALESCE($2, anchor_text),
+                         article_title = COALESCE($3, article_title),
+                         doc_url = COALESCE($4, doc_url),
+                         post_url = COALESCE($5, post_url),
+                         insert_after = COALESCE($6, insert_after),
+                         insert_statement = COALESCE($7, insert_statement),
+                         note = COALESCE($8, note)
+                     WHERE id = $9 AND client_order_id = $10`,
+                    [d.target_url, d.anchor_text, d.article_title, d.doc_url,
+                     d.post_url, d.insert_after, d.insert_statement, d.note,
+                     d.id, orderId]
+                );
+
+                // If linked to a standard order process, update new_order_process_details as well
+                if (linkedNewOrderId) {
+                    const processDetailResult = await query(
+                        `SELECT nopd.id 
+                         FROM new_order_process_details nopd
+                         JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
+                         JOIN client_order_details cod ON cod.site_id = nopd.new_site_id
+                         WHERE nop.new_order_id = $1 AND cod.id = $2`,
+                        [linkedNewOrderId, d.id]
+                    );
+
+                    if (processDetailResult.rows[0]) {
+                        const nopdId = processDetailResult.rows[0].id;
+                        await query(
+                            `UPDATE new_order_process_details 
+                             SET url = COALESCE($1, url), 
+                                 anchor = COALESCE($2, anchor),
+                                 title = COALESCE($3, title),
+                                 doc_urls = COALESCE($4, doc_urls),
+                                 ourl = COALESCE($5, ourl),
+                                 insert_after = COALESCE($6, insert_after),
+                                 statement = COALESCE($7, statement),
+                                 note = COALESCE($8, note)
+                             WHERE id = $9`,
+                            [d.target_url, d.anchor_text, d.article_title, d.doc_url,
+                             d.post_url, d.insert_after, d.insert_statement, d.note,
+                             nopdId]
+                        );
+                    }
+                }
+            }
+        }
+
+        res.json({ message: 'Client order updated successfully' });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   POST /api/manager/client-orders/:id/reject
+ * @desc    Reject a client order and issue a full refund to their wallet
+ * @access  Manager only
+ */
+const rejectClientOrder = async (req, res, next) => {
+    try {
+        const orderId = req.params.id;
+        const { manager_notes } = req.body;
+
+        // 1. Get the client order
+        const orderResult = await query(
+            `SELECT id, client_user_id, status, total_price 
+             FROM client_orders 
+             WHERE id = $1`,
+            [orderId]
+        );
+
+        if (orderResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Client order not found' });
+        }
+
+        const order = orderResult.rows[0];
+
+        // 2. Ensure order isn't already rejected or completed
+        if (order.status === 'rejected' || order.status === 'completed') {
+            return res.status(400).json({ 
+                error: 'Invalid State',
+                message: `Cannot reject order because it is already ${order.status}`
+            });
+        }
+
+        // 3. Update order status and notes
+        await query(
+            `UPDATE client_orders 
+             SET status = 'rejected', manager_notes = $1, updated_at = CURRENT_TIMESTAMP 
+             WHERE id = $2`,
+            [manager_notes || 'Order rejected by manager', orderId]
+        );
+
+        // 4. Issue Refund if there was a charge
+        const refundAmount = parseFloat(order.total_price || 0);
+        if (refundAmount > 0) {
+            // Get user's wallet
+            const walletResult = await query('SELECT id, balance FROM wallets WHERE user_id = $1', [order.client_user_id]);
+            
+            if (walletResult.rows.length > 0) {
+                const walletId = walletResult.rows[0].id;
+                const newBalance = parseFloat(walletResult.rows[0].balance || 0) + refundAmount;
+                
+                // Update wallet balance atomically
+                await query(
+                    'UPDATE wallets SET balance = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+                    [newBalance, walletId]
+                );
+
+                // Log refund in wallet_histories
+                await query(
+                    `INSERT INTO wallet_histories (wallet_id, type, price, remarks, status, created_at, updated_at, approved_date)
+                     VALUES ($1, 'Credit', $2, $3, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                    [walletId, refundAmount, `Refund for rejected Order #${orderId}`]
+                );
+                
+                logger.info('Manager', `Refunded $${refundAmount} to user ${order.client_user_id} for rejected order ${orderId}`);
+            }
+        }
+
+        res.json({ message: 'Order rejected and refunded successfully' });
+    } catch (error) {
+        logger.error('Manager:RejectClientOrder', error);
+        next(error);
+    }
+};
+
+/**
+ * @route   POST /api/manager/client-orders/:id/push-to-blogger
+ * @desc    Push a client order to the normal order flow (creates new_orders + pushes to blogger)
+ * @access  Manager only
+ */
+const pushClientOrderToBlogger = async (req, res, next) => {
+    try {
+        const clientOrderId = req.params.id;
+        const managerId = req.user.id;
+        const { send_email = true } = req.body;
+
+        // Get the client order
+        const orderResult = await query(
+            `SELECT co.*, u.name as client_name_user 
+             FROM client_orders co 
+             LEFT JOIN users u ON u.id = co.client_user_id 
+             WHERE co.id = $1`,
+            [clientOrderId]
+        );
+
+        if (orderResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Client order not found' });
+        }
+
+        const clientOrder = orderResult.rows[0];
+
+        if (clientOrder.status === 'pushed_to_blogger' || clientOrder.status === 'completed') {
+            return res.status(400).json({ error: 'This order has already been processed' });
+        }
+
+        // Get the order details
+        const detailsResult = await query(
+            `SELECT cod.*, ns.root_domain, ns.uploaded_user_id as vendor_id, ns.gp_price, ns.niche_edit_price
+             FROM client_order_details cod 
+             LEFT JOIN new_sites ns ON ns.id = cod.site_id 
+             WHERE cod.client_order_id = $1`,
+            [clientOrderId]
+        );
+
+        if (detailsResult.rows.length === 0) {
+            return res.status(400).json({ error: 'No sites found in this order' });
+        }
+
+        // Verify all sites have a vendor
+        for (const d of detailsResult.rows) {
+            if (!d.vendor_id) {
+                return res.status(400).json({
+                    error: `Site "${d.root_domain}" does not have an owner. Cannot push to blogger.`
+                });
+            }
+        }
+
+        const orderId = `CLT-${clientOrderId}-${Date.now()}`;
+        const isNicheEdit = (clientOrder.order_type || '').toLowerCase().includes('niche');
+
+        // Create the standard order
+        const newOrderResult = await query(
+            `INSERT INTO new_orders (manager_id, team_id, order_id, client_name, client_website, no_of_links, order_type, order_package, message, category, new_order_status, type, created_at, updated_at)
+             VALUES ($1, 0, $2, $3, '', $4, $5, $6, $7, $8, 4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`,
+            [managerId, orderId, clientOrder.client_name_user || 'Client', detailsResult.rows.length, clientOrder.order_type, clientOrder.order_package || '', clientOrder.notes || '', clientOrder.category || '']
+        );
+        const newOrderId = newOrderResult.rows[0].id;
+
+        // Create the process
+        const processResult = await query(
+            `INSERT INTO new_order_processes (new_order_id, team_id, manager_id, status, note, created_at, updated_at) 
+             VALUES ($1, 0, $2, 5, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`,
+            [newOrderId, managerId, clientOrder.manager_notes || clientOrder.notes || '']
+        );
+        const processId = processResult.rows[0].id;
+
+        // Create details and push to bloggers
+        const pushedTasks = [];
+        for (const d of detailsResult.rows) {
+            await query(
+                `INSERT INTO new_order_process_details 
+                 (new_order_process_id, new_site_id, url, anchor, title, note, doc_urls, ourl, insert_after, statement, price, vendor_id, status, type, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, 5, $12, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                [processId, d.site_id, d.target_url || '', d.anchor_text || '', d.article_title || '', d.note || '',
+                 d.doc_url || '', d.post_url || '', d.insert_after || '', d.insert_statement || '',
+                 d.vendor_id, isNicheEdit ? 'insert' : 'insert']
+            );
+
+            pushedTasks.push({ root_domain: d.root_domain, vendor_id: d.vendor_id });
+        }
+
+        // Update client order status
+        await query(
+            `UPDATE client_orders SET status = 'pushed_to_blogger', linked_new_order_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+            [newOrderId, clientOrderId]
+        );
+
+        // Send email notifications
+        if (send_email && pushedTasks.length > 0) {
+            try {
+                const grouped = {};
+                for (const task of pushedTasks) {
+                    if (!grouped[task.vendor_id]) {
+                        const userResult = await query('SELECT name, email FROM users WHERE id = $1', [task.vendor_id]);
+                        grouped[task.vendor_id] = { email: userResult.rows[0]?.email, name: userResult.rows[0]?.name, tasks: [] };
+                    }
+                    grouped[task.vendor_id].tasks.push({ root_domain: task.root_domain, order_id: orderId });
+                }
+                for (const vendorId of Object.keys(grouped)) {
+                    const g = grouped[vendorId];
+                    if (g.email) sendOrderAssignedEmail(g.email, g.name, g.tasks);
+                }
+            } catch (emailErr) {
+                console.error('Client order email failed (non-blocking):', emailErr.message);
+            }
+        }
+
+        res.json({
+            message: 'Client order pushed to bloggers successfully',
+            new_order_id: newOrderId,
+            pushed_count: pushedTasks.length
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+
+
+/**
+ * @route   POST /api/manager/client-orders/:id/send-to-writer
+ * @desc    Send client order to writer (creates standard order & assigns to writer)
+ * @access  Manager only
+ */
+const sendClientOrderToWriter = async (req, res, next) => {
+    try {
+        const clientOrderId = req.params.id;
+        const managerId = req.user.id;
+        const { writer_id, instructions } = req.body;
+
+        if (!writer_id) {
+            return res.status(400).json({ error: 'Writer ID is required' });
+        }
+
+        // Verify writer exists and has Writer role
+        const writerCheck = await query(
+            "SELECT id, role FROM users WHERE id = $1 AND LOWER(role) = 'writer'",
+            [writer_id]
+        );
+
+        if (writerCheck.rows.length === 0) {
+            return res.status(400).json({
+                error: 'Validation Error',
+                message: 'Invalid writer ID or user is not a writer'
+            });
+        }
+
+        // Get the client order
+        const orderResult = await query(
+            `SELECT co.*, u.name as client_name_user 
+             FROM client_orders co 
+             LEFT JOIN users u ON u.id = co.client_user_id 
+             WHERE co.id = $1`,
+            [clientOrderId]
+        );
+
+        if (orderResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Client order not found' });
+        }
+
+        const clientOrder = orderResult.rows[0];
+
+        if (clientOrder.status !== 'pending_review') {
+            return res.status(400).json({ error: 'This order has already been processed' });
+        }
+
+        // Get the order details
+        const detailsResult = await query(
+            `SELECT cod.*, ns.root_domain, ns.uploaded_user_id as vendor_id, ns.gp_price, ns.niche_edit_price
+             FROM client_order_details cod 
+             LEFT JOIN new_sites ns ON ns.id = cod.site_id 
+             WHERE cod.client_order_id = $1`,
+            [clientOrderId]
+        );
+
+        if (detailsResult.rows.length === 0) {
+            return res.status(400).json({ error: 'No sites found in this order' });
+        }
+
+        const hasDelegated = detailsResult.rows.some(d => !d.fill_details);
+        if (!hasDelegated) {
+            return res.status(400).json({ error: 'Only orders containing at least one delegated website can be sent to a writer' });
+        }
+
+        // Verify all sites have a vendor/owner
+        for (const d of detailsResult.rows) {
+            if (!d.vendor_id) {
+                return res.status(400).json({
+                    error: `Site "${d.root_domain}" does not have an owner. Cannot delegate.`
+                });
+            }
+        }
+
+        const orderId = `CLT-WRT-${clientOrderId}-${Date.now()}`;
+        const isNicheEdit = (clientOrder.order_type || '').toLowerCase().includes('niche');
+
+        // Create the standard order task (status: 3 = Assigned to Writer)
+        const newOrderResult = await query(
+            `INSERT INTO new_orders (manager_id, team_id, order_id, client_name, client_website, no_of_links, order_type, order_package, message, category, new_order_status, type, created_at, updated_at)
+             VALUES ($1, 0, $2, $3, '', $4, $5, $6, $7, $8, 3, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`,
+            [managerId, orderId, clientOrder.client_name_user || 'Client', detailsResult.rows.length, clientOrder.order_type, clientOrder.order_package || '', instructions || clientOrder.notes || '', clientOrder.category || '']
+        );
+        const newOrderId = newOrderResult.rows[0].id;
+
+        // Create the process record (status: 3 = Assigned to Writer, with writer_id)
+        const processResult = await query(
+            `INSERT INTO new_order_processes (new_order_id, team_id, writer_id, manager_id, status, note, statement, created_at, updated_at) 
+             VALUES ($1, 0, $2, $3, 3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`,
+            [newOrderId, writer_id, managerId, clientOrder.manager_notes || clientOrder.notes || '', instructions || '']
+        );
+        const processId = processResult.rows[0].id;
+
+        // Create process details for each site
+        for (const d of detailsResult.rows) {
+            const detailStatus = d.fill_details ? 4 : 3;
+            await query(
+                `INSERT INTO new_order_process_details 
+                 (new_order_process_id, new_site_id, url, anchor, title, note, doc_urls, ourl, insert_after, statement, price, vendor_id, status, type, fill_details, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, $12, $13, $14, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                [processId, d.site_id, d.target_url || '', d.anchor_text || '', d.article_title || '', d.note || '',
+                 d.doc_url || '', d.post_url || '', d.insert_after || '', d.insert_statement || '',
+                 d.vendor_id, detailStatus, isNicheEdit ? 'insert' : 'insert', d.fill_details]
+            );
+        }
+
+        // Update client order status and link the new_order_id
+        await query(
+            `UPDATE client_orders SET status = 'sent_to_writer', linked_new_order_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+            [newOrderId, clientOrderId]
+        );
+
+        res.json({
+            message: 'Client order delegated to writer successfully',
+            new_order_id: newOrderId
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
 module.exports = {
     getDashboardStats,
     getTasks,
@@ -2591,5 +3462,12 @@ module.exports = {
     getProfile,
     updateProfile,
     uploadProfileImage,
-    deleteOrder
+    deleteOrder,
+    getClientOrders,
+    getClientOrderDetails,
+    updateClientOrder,
+    rejectClientOrder,
+    pushClientOrderToBlogger,
+    sendClientOrderToWriter,
+    reassignClientOrder
 };

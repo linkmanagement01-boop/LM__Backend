@@ -4,6 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const managerController = require('../controllers/managerController');
+const adminSitesController = require('../controllers/adminSitesController');
 const { authenticate, authorize } = require('../middleware/auth');
 
 // Ensure profile upload directory exists
@@ -101,6 +102,23 @@ router.get('/blogger-submissions/:id', managerController.getBloggerSubmissionDet
 router.post('/blogger-submissions/:id/finalize', managerController.finalizeFromBlogger);
 // Reject blogger submission - send back to blogger with reason
 router.post('/blogger-submissions/:id/reject', managerController.rejectBloggerSubmission);
+
+// ==================== CLIENT ORDER MANAGEMENT ====================
+// Get all client orders pending review
+router.get('/client-orders', managerController.getClientOrders);
+// Get client order details
+router.get('/client-orders/:id', managerController.getClientOrderDetails);
+// Update client order details (manager can edit before pushing)
+router.put('/client-orders/:id', managerController.updateClientOrder);
+router.post('/client-orders/:id/reject', managerController.rejectClientOrder);
+// Push client order to blogger (converts to normal order flow)
+router.post('/client-orders/:id/push-to-blogger', managerController.pushClientOrderToBlogger);
+// Send client order to writer
+router.post('/client-orders/:id/send-to-writer', managerController.sendClientOrderToWriter);
+
+// ==================== LINK COMPLETED (Admin parity) ====================
+router.get('/sites/link-completed', adminSitesController.getCompletedLinks);
+router.post('/sites/check-link-status', adminSitesController.checkLinkStatus);
 
 module.exports = router;
 

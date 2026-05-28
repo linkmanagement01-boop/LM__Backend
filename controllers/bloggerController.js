@@ -5,7 +5,7 @@ const Transaction = require('../models/Transaction');
 const User = require('../models/User');
 const Website = require('../models/Website');
 const { getAvailableBalance, getUnapprovedCreditsBalance } = require('../utils/walletService');
-const { query } = require('../config/database');
+const { query, transaction } = require('../config/database');
 const { sendSiteAddedEmail } = require('../utils/emailService');
 
 /**
@@ -132,7 +132,7 @@ const getMyTasks = async (req, res, next) => {
                 if (status === 8) return 'completed';
                 // Status 11 = manager rejected (blogger needs to resubmit)
                 if (status === 11) return 'rejected';
-                
+
                 if (status === 7 || row.submit_url) return 'waiting';
                 return 'pending'; // status 5 or assigned but not submitted
             })(),
@@ -1758,6 +1758,25 @@ const getBulkUploadHistory = async (req, res, next) => {
  * id = new_order_process_details.id (detail_id)
  * Updates status to 11 (rejected) and stores rejection reason
  */
+/**
+ * Helper: Applies tiered markup logic (mirrors clientController's applyClientMarkup).
+ * Used as fallback when client_order_details.price is not populated.
+ */
+function applyClientMarkup(priceStr) {
+    if (priceStr === null || priceStr === undefined) return priceStr;
+    const price = parseFloat(priceStr.toString().replace(/[^0-9.]/g, ''));
+    if (isNaN(price)) return priceStr;
+    
+    if (price <= 10) return 30;
+    if (price <= 25) return 50;
+    if (price <= 50) return 79;
+    if (price <= 79) return 100;
+    if (price < 100) return 130;
+    
+    const markedUp = price * 1.30;
+    return Math.round(markedUp * 100) / 100;
+}
+
 const rejectTask = async (req, res, next) => {
     try {
         const { id } = req.params;
@@ -1775,8 +1794,8 @@ const rejectTask = async (req, res, next) => {
         // Verify the detail belongs to this blogger
         const detailCheck = await query(
             `SELECT nopd.id, nopd.vendor_id, nopd.status,
-                    nopd.new_order_process_id,
-                    ns.root_domain
+                    nopd.new_order_process_id, nopd.new_site_id,
+                    ns.root_domain, ns.gp_price, ns.niche_edit_price
              FROM new_order_process_details nopd
              JOIN new_sites ns ON nopd.new_site_id = ns.id
              WHERE nopd.id = $1`,
@@ -1814,48 +1833,188 @@ const rejectTask = async (req, res, next) => {
             });
         }
 
-        // Update the detail with rejection status (12 = blogger rejected) and reason
-        // Note: Status 11 = Manager rejected blogger's submission (for revision)
-        //       Status 12 = Blogger rejected the assignment (refused to do it)
-        await query(
-            `UPDATE new_order_process_details 
-             SET status = 12, reject_reason = $1, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $2`,
-            [rejection_reason, id]
-        );
+        // ── Wrap entire rejection + refund flow in a database transaction ──
+        const result = await transaction(async (client) => {
+            // 1. Update the detail with rejection status (12 = blogger rejected) and reason
+            await client.query(
+                `UPDATE new_order_process_details 
+                 SET status = 12, reject_reason = $1, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $2`,
+                [rejection_reason, id]
+            );
 
-        // Check if all details for this process are completed or rejected by blogger
-        const processCheck = await query(
-            `SELECT COUNT(*) as pending FROM new_order_process_details 
-             WHERE new_order_process_id = $1 AND status NOT IN (8, 12)`,
-            [detail.new_order_process_id]
-        );
+            // 2. Find linked client order for refund processing
+            let refundAmount = 0;
+            let clientUserId = null;
+            let clientOrderId = null;
 
-        const allLinksResolved = parseInt(processCheck.rows[0].pending) === 0;
+            const clientOrderLookup = await client.query(
+                `SELECT co.id as client_order_id, co.client_user_id, co.order_type,
+                        cod.price as stored_price, cod.site_id
+                 FROM new_order_processes nop
+                 JOIN new_orders no ON no.id = nop.new_order_id
+                 JOIN client_orders co ON co.linked_new_order_id = no.id
+                 JOIN client_order_details cod ON cod.client_order_id = co.id AND cod.site_id = $2
+                 WHERE nop.id = $1
+                 LIMIT 1`,
+                [detail.new_order_process_id, detail.new_site_id]
+            );
 
-        // If all details are resolved, update process AND order status to completed
-        if (allLinksResolved) {
-            await query(
-                `UPDATE new_order_processes SET status = 8, updated_at = CURRENT_TIMESTAMP 
-                 WHERE id = $1`,
+            if (clientOrderLookup.rows.length > 0) {
+                const clientOrder = clientOrderLookup.rows[0];
+                clientUserId = clientOrder.client_user_id;
+                clientOrderId = clientOrder.client_order_id;
+
+                // Calculate refund amount
+                if (clientOrder.stored_price !== null && clientOrder.stored_price !== undefined) {
+                    refundAmount = parseFloat(clientOrder.stored_price);
+                } else {
+                    // Fallback: calculate from site price + markup
+                    const priceStr = clientOrder.order_type === 'Guest Post'
+                        ? detail.gp_price
+                        : detail.niche_edit_price;
+                    const markup = applyClientMarkup(priceStr);
+                    if (markup !== null && markup !== undefined) {
+                        refundAmount = parseFloat(markup.toString().replace(/[^0-9.]/g, ''));
+                    }
+                }
+
+                if (!isNaN(refundAmount) && refundAmount > 0 && clientUserId) {
+                    // 3. Check for duplicate refund (guard against double-processing)
+                    const dupCheck = await client.query(
+                        `SELECT id FROM wallet_histories 
+                         WHERE order_detail_id = $1 AND type = 'Credit'
+                         LIMIT 1`,
+                        [parseInt(id)]
+                    );
+
+                    if (dupCheck.rows.length === 0) {
+                        // 4. Credit client wallet atomically
+                        await client.query(
+                            `UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP
+                             WHERE user_id = $2`,
+                            [refundAmount, clientUserId]
+                        );
+
+                        // 5. Get wallet_id for logging
+                        const walletRes = await client.query(
+                            `SELECT id FROM wallets WHERE user_id = $1`,
+                            [clientUserId]
+                        );
+
+                        if (walletRes.rows.length > 0) {
+                            // 6. Log refund transaction in wallet_histories
+                            await client.query(
+                                `INSERT INTO wallet_histories 
+                                 (wallet_id, order_detail_id, type, price, remarks, status, created_at, updated_at, approved_date)
+                                 VALUES ($1, $2, 'Credit', $3, $4, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                                [
+                                    walletRes.rows[0].id,
+                                    parseInt(id),
+                                    refundAmount,
+                                    `Refund for rejected site: ${detail.root_domain} (Blogger rejected)`
+                                ]
+                            );
+                        }
+
+                        // 7. Create notification for client
+                        const notificationId = require('crypto').randomUUID();
+                        const notificationData = JSON.stringify({
+                            title: 'Order Refund – Blogger Rejected',
+                            message: `Your order for ${detail.root_domain} was rejected by the blogger. $${refundAmount.toFixed(2)} has been refunded to your wallet.`,
+                            reason: rejection_reason,
+                            refund_amount: refundAmount,
+                            site: detail.root_domain
+                        });
+
+                        await client.query(
+                            `INSERT INTO notifications (id, type, notifiable_type, notifiable_id, data, created_at, updated_at)
+                             VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                            [
+                                notificationId,
+                                'App\\Notifications\\OrderRefund',
+                                'App\\Models\\User',
+                                clientUserId,
+                                notificationData
+                            ]
+                        );
+                    }
+                }
+            }
+
+            // 8. Check if all details for this process are completed or rejected
+            const processCheck = await client.query(
+                `SELECT 
+                    COUNT(*) as total,
+                    COUNT(*) FILTER (WHERE status NOT IN (8, 12)) as pending,
+                    COUNT(*) FILTER (WHERE status = 12) as rejected_count,
+                    COUNT(*) FILTER (WHERE status = 8) as completed_count
+                 FROM new_order_process_details 
+                 WHERE new_order_process_id = $1`,
                 [detail.new_order_process_id]
             );
 
-            await query(
-                `UPDATE new_orders SET new_order_status = 5, updated_at = CURRENT_TIMESTAMP 
-                 WHERE id = (SELECT new_order_id FROM new_order_processes WHERE id = $1)`,
-                [detail.new_order_process_id]
-            );
-        }
+            const stats = processCheck.rows[0];
+            const allLinksResolved = parseInt(stats.pending) === 0;
+            const allRejected = parseInt(stats.rejected_count) === parseInt(stats.total);
+
+            // 9. If all details are resolved, update process AND order statuses
+            if (allLinksResolved) {
+                await client.query(
+                    `UPDATE new_order_processes SET status = 8, updated_at = CURRENT_TIMESTAMP 
+                     WHERE id = $1`,
+                    [detail.new_order_process_id]
+                );
+
+                if (allRejected) {
+                    // All sites rejected → mark order as rejected
+                    await client.query(
+                        `UPDATE new_orders SET new_order_status = 6, updated_at = CURRENT_TIMESTAMP 
+                         WHERE id = (SELECT new_order_id FROM new_order_processes WHERE id = $1)`,
+                        [detail.new_order_process_id]
+                    );
+
+                    if (clientOrderId) {
+                        await client.query(
+                            `UPDATE client_orders SET status = 'rejected', updated_at = CURRENT_TIMESTAMP
+                             WHERE id = $1`,
+                            [clientOrderId]
+                        );
+                    }
+                } else {
+                    // Mixed: some completed, some rejected → completed with partial refund
+                    await client.query(
+                        `UPDATE new_orders SET new_order_status = 5, updated_at = CURRENT_TIMESTAMP 
+                         WHERE id = (SELECT new_order_id FROM new_order_processes WHERE id = $1)`,
+                        [detail.new_order_process_id]
+                    );
+
+                    if (clientOrderId) {
+                        await client.query(
+                            `UPDATE client_orders SET status = 'COMPLETED_REJECTED', updated_at = CURRENT_TIMESTAMP
+                             WHERE id = $1`,
+                            [clientOrderId]
+                        );
+                    }
+                }
+            }
+
+            return { allLinksResolved, allRejected, refundAmount, clientUserId };
+        });
+
+        const responseMessage = result.allLinksResolved
+            ? (result.allRejected
+                ? 'Task rejected. All links in this order were rejected — order marked as Rejected and client refunded.'
+                : 'Task rejected. All links resolved — order completed with partial refunds.')
+            : 'Task rejected successfully. Client has been refunded and manager will be notified.';
 
         res.json({
-            message: allLinksResolved
-                ? 'Task rejected. All links in this order are now resolved — order marked as Completed.'
-                : 'Task rejected successfully. Manager will be notified.',
+            message: responseMessage,
             detail_id: id,
             root_domain: detail.root_domain,
             rejection_reason,
-            all_links_resolved: allLinksResolved
+            all_links_resolved: result.allLinksResolved,
+            refund_amount: result.refundAmount > 0 ? result.refundAmount : undefined
         });
     } catch (error) {
         next(error);
@@ -2030,7 +2189,6 @@ const downloadInvoicePdf = async (req, res, next) => {
                                 THEN REGEXP_REPLACE(ns.gp_price::text, '[^0-9.]', '', 'g')::DOUBLE PRECISION
                             ELSE 0 END
                 END as price,
-                wh.remarks,
                 nopd.submit_url, 
                 ns.root_domain, 
                 no.order_id as manual_order_id
@@ -2046,15 +2204,8 @@ const downloadInvoicePdf = async (req, res, next) => {
         const totalAmount = itemsResult.rows.reduce((sum, row) => sum + parseFloat(row.price || 0), 0);
         const invNum = wr.invoice_pre ? `${wr.invoice_pre}${wr.invoice_number}` : (wr.invoice_number || (100000 + parseInt(id)));
 
-        // Extract remarks dynamically (matching getInvoiceDetail logic)
-        let invoiceNote = 'Thank you for your business!';
-        const validRemarkObj = itemsResult.rows.find(row => row.remarks && row.remarks.trim() !== '');
-        if (validRemarkObj) {
-            invoiceNote = validRemarkObj.remarks.trim();
-        }
-
         // Create PDF
-        const doc = new PDFDocument({ margin: 50, bufferPages: true });
+        const doc = new PDFDocument({ margin: 50 });
         const filename = `invoice-LM${invNum}.pdf`;
 
         res.setHeader('Content-Type', 'application/pdf');
@@ -2082,10 +2233,10 @@ const downloadInvoicePdf = async (req, res, next) => {
         doc.fontSize(10).font('Helvetica').text(wr.name);
         doc.text(`Email: ${wr.email}`);
         doc.text(`Country: ${wr.country_name || 'N/A'}`);
-        doc.moveDown(2);
+        doc.moveDown();
 
-        // Items Table Header - use current Y position instead of hardcoded 300
-        const tableTop = doc.y;
+        // Items Table Header
+        const tableTop = 300;
         doc.fontSize(10).font('Helvetica-Bold');
         doc.text('Service/Link', 50, tableTop);
         doc.text('Order ID', 350, tableTop);
@@ -2093,17 +2244,10 @@ const downloadInvoicePdf = async (req, res, next) => {
 
         doc.moveTo(50, tableTop + 15).lineTo(550, tableTop + 15).stroke();
 
-        // Items - with page break handling
+        // Items
         let y = tableTop + 25;
-        const pageHeight = doc.page.height - doc.page.margins.bottom;
         doc.font('Helvetica');
         itemsResult.rows.forEach(item => {
-            // Check if we need a new page
-            if (y > pageHeight - 60) {
-                doc.addPage();
-                y = doc.page.margins.top;
-            }
-
             const price = `$${parseFloat(item.price || 0).toFixed(2)}`;
             const link = item.submit_url || item.root_domain || 'N/A';
             const orderId = item.manual_order_id || 'N/A';
@@ -2122,13 +2266,8 @@ const downloadInvoicePdf = async (req, res, next) => {
         doc.text('Total', 350, y);
         doc.text(`$${totalAmount.toFixed(2)}`, 480, y, { align: 'right' });
 
-        // Remarks / Note - use relative positioning instead of absolute Y=700
-        doc.y = y + 40;
-        doc.fontSize(10).font('Helvetica-Bold').text('Remarks:', 50);
-        doc.fontSize(10).font('Helvetica').text(invoiceNote, 50, undefined, { width: 500 });
-
-        doc.moveDown(2);
-        doc.fontSize(10).font('Helvetica-Oblique').text('Thank you for your business!', { align: 'center' });
+        // Footer
+        doc.fontSize(10).font('Helvetica-Oblique').text('Thank you for your business!', 50, 700, { align: 'center' });
 
         doc.end();
     } catch (error) {

@@ -58,6 +58,10 @@ const getTaskById = async (req, res, next) => {
             });
         }
 
+        if (task.selected_websites) {
+            task.selected_websites = task.selected_websites.filter(sw => !sw.fill_details);
+        }
+
         res.json({ task });
     } catch (error) {
         next(error);
@@ -486,6 +490,7 @@ const getCompletedOrderDetail = async (req, res, next) => {
                 nopd.statement,
                 nopd.type as niche_type,
                 nopd.status as detail_status,
+                nopd.fill_details,
                 nopd.created_at as detail_created_at,
                 nopd.updated_at as detail_updated_at,
                 ns.root_domain as website_domain
@@ -512,7 +517,7 @@ const getCompletedOrderDetail = async (req, res, next) => {
                 order_notes: process.order_notes,
                 status: process.process_status >= 5 ? 'Completed' : 'Submitted',
                 // All detail rows for this order
-                details: detailsResult.rows.map(d => ({
+                details: detailsResult.rows.filter(d => !d.fill_details).map(d => ({
                     id: d.detail_id,
                     root_domain: d.website_domain,
                     url: d.target_url,
