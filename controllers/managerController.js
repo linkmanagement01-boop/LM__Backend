@@ -3118,7 +3118,7 @@ const rejectClientOrder = async (req, res, next) => {
 
         // 1. Get the client order
         const orderResult = await query(
-            `SELECT id, client_user_id, status, total_price 
+            `SELECT id, client_user_id, status, total_price, order_number 
              FROM client_orders 
              WHERE id = $1`,
             [orderId]
@@ -3166,7 +3166,7 @@ const rejectClientOrder = async (req, res, next) => {
                 await query(
                     `INSERT INTO wallet_histories (wallet_id, type, price, remarks, status, created_at, updated_at, approved_date)
                      VALUES ($1, 'Credit', $2, $3, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-                    [walletId, refundAmount, `Refund for rejected Order #${orderId}`]
+                    [walletId, refundAmount, `Refund for rejected Order ${order.order_number || ('#' + orderId)}`]
                 );
                 
                 logger.info('Manager', `Refunded $${refundAmount} to user ${order.client_user_id} for rejected order ${orderId}`);

@@ -50,6 +50,7 @@ const getFinancialReport = async (req, res, next) => {
             SELECT 
                 co.created_at as date,
                 co.id as order_id,
+                co.order_number,
                 c.id as client_id,
                 c.name as client_name,
                 c.email as client_email,

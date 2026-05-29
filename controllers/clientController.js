@@ -490,12 +490,21 @@ const createOrder = async (req, res, next) => {
         }
 
         // 5. Create client order
+        const clientUserRes = await query('SELECT name FROM users WHERE id = $1', [clientId]);
+        const clientName = clientUserRes.rows[0]?.name || 'Client';
+        const cleanName = clientName.replace(/[^a-zA-Z0-9]/g, '') || 'Client';
+
+        const countRes = await query('SELECT COUNT(*) as count FROM client_orders WHERE client_user_id = $1', [clientId]);
+        const orderSequence = parseInt(countRes.rows[0].count, 10) + 1;
+        const paddedSequence = String(orderSequence).padStart(5, '0');
+        const orderNumber = `${cleanName}-${paddedSequence}`;
+
         const globalFillDetails = websites.every(w => w.fill_details !== false);
         const orderResult = await query(
             `INSERT INTO client_orders 
-             (client_user_id, order_type, no_of_links, status, fill_details, notes, order_package, category, total_price, assigned_to, assigned_at, created_at) 
-             VALUES ($1, $2, $3, 'pending_review', $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP) 
-             RETURNING id`,
+             (client_user_id, order_type, no_of_links, status, fill_details, notes, order_package, category, total_price, assigned_to, assigned_at, created_at, order_number) 
+             VALUES ($1, $2, $3, 'pending_review', $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP, $11) 
+             RETURNING id, order_number`,
             [
                 clientId, 
                 order_type, 
@@ -506,7 +515,8 @@ const createOrder = async (req, res, next) => {
                 category || '', 
                 totalPrice,
                 assignedManagerId,
-                assignedManagerId ? new Date() : null
+                assignedManagerId ? new Date() : null,
+                orderNumber
             ]
         );
 
@@ -516,7 +526,7 @@ const createOrder = async (req, res, next) => {
         await query(
             `INSERT INTO wallet_histories (wallet_id, type, price, remarks, status, created_at, updated_at, approved_date)
              VALUES ($1, 'Debit', $2, $3, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-            [walletId, totalPrice, `Payment for ${order_type} Order #${clientOrderId} (${websites.length} sites)`]
+            [walletId, totalPrice, `Payment for ${order_type} Order ${orderNumber} (${websites.length} sites)`]
         );
 
         // Insert website details for each selected site (including marked-up price for refund tracking)
@@ -547,7 +557,8 @@ const createOrder = async (req, res, next) => {
 
         res.status(201).json({
             message: 'Order created successfully. Manager will review it shortly.',
-            order_id: clientOrderId
+            order_id: clientOrderId,
+            order_number: orderResult.rows[0].order_number
         });
     } catch (error) {
         logger.error('Client:CreateOrder', error);
