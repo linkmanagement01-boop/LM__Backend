@@ -299,52 +299,96 @@ const verifyPayment = async (req, res, next) => {
  */
 const getSites = async (req, res, next) => {
     try {
-        const { page = 1, limit = 20, search_domain, search_category, filter_traffic_val, filter_traffic_op } = req.query;
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
         const offset = (page - 1) * limit;
 
-        let whereClause = `WHERE (ns.delete_site IS NULL OR ns.delete_site = 0) AND ns.site_status = '1'`;
-        const params = [];
+        // Build dynamic WHERE conditions as an array
+        // Enforce approved/active status only for clients
+        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0) AND ns.site_status = '1'`];
+        const queryParams = [];
         let paramIndex = 1;
 
-        if (search_domain) {
-            whereClause += ` AND ns.root_domain ILIKE $${paramIndex}`;
-            params.push(`%${search_domain}%`);
+        // Text Search Filters
+        if (req.query.search_domain) {
+            conditions.push(`ns.root_domain ILIKE $${paramIndex}`);
+            queryParams.push(`%${req.query.search_domain}%`);
+            paramIndex++;
+        }
+        if (req.query.search_category) {
+            conditions.push(`(ns.category ILIKE $${paramIndex} OR ns.niche ILIKE $${paramIndex})`);
+            queryParams.push(`%${req.query.search_category}%`);
+            paramIndex++;
+        }
+        if (req.query.search_niche) {
+            conditions.push(`ns.website_niche ILIKE $${paramIndex}`);
+            queryParams.push(`%${req.query.search_niche}%`);
             paramIndex++;
         }
 
-        if (search_category) {
-            whereClause += ` AND (ns.category ILIKE $${paramIndex} OR ns.website_niche ILIKE $${paramIndex})`;
-            params.push(`%${search_category}%`);
+        // Dropdown / Attribute Filters
+        if (req.query.filter_fc_gp) {
+            if (req.query.filter_fc_gp === 'yes') conditions.push(`(ns.fc_gp IS NOT NULL AND ns.fc_gp != '')`);
+            else if (req.query.filter_fc_gp === 'no') conditions.push(`(ns.fc_gp IS NULL OR ns.fc_gp = '')`);
+        }
+        if (req.query.filter_fc_ne) {
+            if (req.query.filter_fc_ne === 'yes') conditions.push(`(ns.fc_ne IS NOT NULL AND ns.fc_ne != '')`);
+            else if (req.query.filter_fc_ne === 'no') conditions.push(`(ns.fc_ne IS NULL OR ns.fc_ne = '')`);
+        }
+        if (req.query.filter_new_arrival) {
+            if (req.query.filter_new_arrival === 'yes') conditions.push(`ns.created_at >= NOW() - INTERVAL '7 days'`);
+            else if (req.query.filter_new_arrival === 'no') conditions.push(`ns.created_at < NOW() - INTERVAL '7 days'`);
+        }
+        if (req.query.filter_added_on) {
+            conditions.push(`DATE(ns.created_at) = $${paramIndex}`);
+            queryParams.push(req.query.filter_added_on);
             paramIndex++;
         }
 
-        if (filter_traffic_val) {
-            const op = filter_traffic_op === '<' ? '<' : '>';
-            // Need to cast text to numeric safely
-            const castCol = `(CASE WHEN ns.traffic_source::text ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.traffic_source::numeric ELSE 0 END)`;
-            whereClause += ` AND ${castCol} ${op} $${paramIndex}`;
-            params.push(Number(filter_traffic_val));
-            paramIndex++;
-        }
+        // Numeric Range Filters helper
+        const addRangeFilter = (paramKey, dbCol) => {
+            const val = req.query[`filter_${paramKey}_val`];
+            const op = req.query[`filter_${paramKey}_op`];
+            if (val && op) {
+                let sqlOp = '=';
+                if (op === '>') sqlOp = '>';
+                else if (op === '<') sqlOp = '<';
+
+                const castCol = `(CASE WHEN ${dbCol}::text ~ '^[0-9]+(\\.[0-9]+)?$' THEN ${dbCol}::numeric ELSE 0 END)`;
+                conditions.push(`${castCol} ${sqlOp} $${paramIndex}`);
+                queryParams.push(parseFloat(val));
+                paramIndex++;
+            }
+        };
+
+        addRangeFilter('da', 'ns.da');
+        addRangeFilter('dr', 'ns.dr');
+        addRangeFilter('rd', 'ns.rd');
+        addRangeFilter('traffic', 'ns.traffic_source');
+        addRangeFilter('gp_price', 'ns.gp_price');
+        addRangeFilter('niche_price', 'ns.niche_edit_price');
+
+        const whereClause = 'WHERE ' + conditions.join(' AND ');
 
         // Count total
         const countResult = await query(
             `SELECT COUNT(*) as total FROM new_sites ns ${whereClause}`,
-            params
+            queryParams
         );
         const total = parseInt(countResult.rows[0].total);
 
         // Fetch sites
+        const dataParams = [...queryParams, limit, offset];
         const sitesResult = await query(
             `SELECT ns.id, ns.root_domain, ns.category, ns.website_niche, ns.da, ns.dr, ns.traffic_source as traffic, 
                     ns.rd, ns.spam_score, ns.gp_price, ns.niche_edit_price, ns.website_status,
                     ns.link_type, ns.domain_type, ns.word_count, ns.sample_url,
-                    ns.fc_gp, ns.fc_ne
+                    ns.fc_gp, ns.fc_ne, ns.created_at, ns.updated_at
              FROM new_sites ns 
              ${whereClause} 
              ORDER BY ns.created_at DESC 
              LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
-            [...params, parseInt(limit), parseInt(offset)]
+            dataParams
         );
 
         const markedUpSites = (sitesResult.rows || []).map(site => ({
@@ -356,8 +400,8 @@ const getSites = async (req, res, next) => {
         res.json({
             sites: markedUpSites,
             pagination: {
-                page: parseInt(page),
-                limit: parseInt(limit),
+                page,
+                limit,
                 total,
                 totalPages: Math.ceil(total / limit)
             }
