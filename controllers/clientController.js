@@ -970,7 +970,6 @@ const checkLinkStatus = async (req, res, next) => {
 const getTransactions = async (req, res, next) => {
     try {
         const clientId = req.user.id;
-        console.log(`[DEBUG] getTransactions called for clientId: ${clientId}`);
         const { page = 1, limit = 20, type } = req.query;
         const offset = (page - 1) * limit;
 
