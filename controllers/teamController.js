@@ -665,6 +665,7 @@ const getCompletedOrderDetail = async (req, res, next) => {
                 no.order_type,
                 no.order_package,
                 no.category,
+                no.fc,
                 no.message,
                 no.created_at as order_created_at,
                 m.name as manager_name,
@@ -702,6 +703,8 @@ const getCompletedOrderDetail = async (req, res, next) => {
                 ns.root_domain,
                 ns.niche_edit_price,
                 ns.gp_price,
+                ns.fc_gp,
+                ns.fc_ne,
                 ns.dr,
                 ns.da,
                 ns.traffic
@@ -749,10 +752,19 @@ const getCompletedOrderDetail = async (req, res, next) => {
                 detailsByTimestamp[timestamp] = [];
             }
 
-            // Use price from detail or calculate from site prices
-            const price = detail.price || (order.order_type === 'niche' || order.order_type === 'Niche Edit'
-                ? detail.niche_edit_price
-                : detail.gp_price);
+            // Use price from detail or calculate from site prices (respecting FC flag)
+            const isFC = Number(order.fc) === 1;
+            let price = detail.price;
+            if (!price || isNaN(parseFloat(price)) || parseFloat(price) <= 0) {
+                const type = (order.order_type || '').toLowerCase();
+                if (type.includes('niche') || type.includes('edit') || type.includes('insertion') || type === 'Niche Edit') {
+                    price = (isFC && detail.fc_ne && parseFloat(detail.fc_ne) > 0)
+                        ? detail.fc_ne : detail.niche_edit_price;
+                } else {
+                    price = (isFC && detail.fc_gp && parseFloat(detail.fc_gp) > 0)
+                        ? detail.fc_gp : detail.gp_price;
+                }
+            }
 
             detailsByTimestamp[timestamp].push({
                 id: detail.detail_id,

@@ -513,13 +513,16 @@ const getPendingFromBloggers = async (req, res, next) => {
                 ns.dr,
                 ns.gp_price,
                 ns.niche_edit_price as niche_price,
+                ns.fc_gp,
+                ns.fc_ne,
                 v.name as vendor_name,
                 v.email as vendor_email,
                 nop.new_order_id as db_order_id,
                 no.order_id as manual_order_id,
                 no.client_name,
                 no.order_type,
-                no.category
+                no.category,
+                no.fc
              FROM new_order_process_details nopd
              JOIN new_sites ns ON nopd.new_site_id = ns.id
              JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
@@ -801,6 +804,7 @@ const getOrderDetails = async (req, res, next) => {
                 o.order_package,
                 o.message,
                 o.category,
+                o.fc,
                 o.new_order_status,
                 o.created_at,
                 o.updated_at,
@@ -922,6 +926,8 @@ const getOrderDetails = async (req, res, next) => {
                     ns.dr,
                     ns.niche_edit_price,
                     ns.gp_price,
+                    ns.fc_gp,
+                    ns.fc_ne,
                     b.name as blogger_name,
                     b.email as blogger_email
                  FROM new_order_process_details nopd
@@ -940,7 +946,18 @@ const getOrderDetails = async (req, res, next) => {
             website: d.website,
             da: d.da,
             dr: d.dr,
-            price: d.price || d.niche_edit_price || d.gp_price || 0,
+            price: (() => {
+                const isFC = Number(order.fc) === 1;
+                // If price is stored on the detail row, use it
+                if (d.price && !isNaN(parseFloat(d.price)) && parseFloat(d.price) > 0) return parseFloat(d.price);
+                const type = (order.order_type || '').toLowerCase();
+                if (type.includes('niche') || type.includes('edit') || type.includes('insertion')) {
+                    if (isFC && d.fc_ne && !isNaN(parseFloat(d.fc_ne)) && parseFloat(d.fc_ne) > 0) return parseFloat(d.fc_ne);
+                    return parseFloat(d.niche_edit_price) || 0;
+                }
+                if (isFC && d.fc_gp && !isNaN(parseFloat(d.fc_gp)) && parseFloat(d.fc_gp) > 0) return parseFloat(d.fc_gp);
+                return parseFloat(d.gp_price) || 0;
+            })(),
             anchor: d.anchor,
             target_url: d.url,
             post_url: d.ourl,
@@ -2173,6 +2190,8 @@ const getBloggerSubmissionDetail = async (req, res, next) => {
         ns.dr,
         ns.gp_price,
         ns.niche_edit_price as niche_price,
+        ns.fc_gp,
+        ns.fc_ne,
         v.name as vendor_name,
         v.email as vendor_email,
         nop.new_order_id as order_id,
@@ -2180,6 +2199,7 @@ const getBloggerSubmissionDetail = async (req, res, next) => {
         no.client_name,
         no.order_type,
         no.category,
+        no.fc,
         no.message as order_notes
              FROM new_order_process_details nopd
              JOIN new_sites ns ON nopd.new_site_id = ns.id
@@ -2213,8 +2233,15 @@ const getBloggerSubmissionDetail = async (req, res, next) => {
             dr: row.dr,
             price: (() => {
                 const type = (row.order_type || '').toLowerCase();
+                const isFC = Number(row.fc) === 1;
                 if (type.includes('niche') || type.includes('edit') || type.includes('insertion')) {
+                    if (isFC && row.fc_ne && !isNaN(parseFloat(row.fc_ne)) && parseFloat(row.fc_ne) > 0) {
+                        return parseFloat(row.fc_ne);
+                    }
                     return (row.niche_price && !isNaN(parseFloat(row.niche_price))) ? parseFloat(row.niche_price) : 0;
+                }
+                if (isFC && row.fc_gp && !isNaN(parseFloat(row.fc_gp)) && parseFloat(row.fc_gp) > 0) {
+                    return parseFloat(row.fc_gp);
                 }
                 return (row.gp_price && !isNaN(parseFloat(row.gp_price))) ? parseFloat(row.gp_price) : 0;
             })(),

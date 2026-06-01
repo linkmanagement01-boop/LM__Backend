@@ -57,6 +57,8 @@ const getMyTasks = async (req, res, next) => {
                 ns.dr,
                 ns.gp_price,
                 ns.niche_edit_price as niche_price,
+                ns.fc_gp,
+                ns.fc_ne,
                 nop.new_order_id as order_id,
                 nop.status as process_status,
                 no.order_id as manual_order_id,
@@ -64,6 +66,7 @@ const getMyTasks = async (req, res, next) => {
                 no.client_website,
                 no.order_type,
                 no.category,
+                no.fc,
                 no.message as order_notes,
                 COALESCE(no.created_at, nopd.created_at, CURRENT_TIMESTAMP) as order_created_at,
                 m.name as manager_name,
@@ -97,8 +100,15 @@ const getMyTasks = async (req, res, next) => {
             dr: row.dr,
             price: (() => {
                 const type = (row.order_type || '').toLowerCase();
+                const isFC = Number(row.fc) === 1;
                 if (type.includes('niche') || type.includes('edit') || type.includes('insertion')) {
+                    if (isFC && row.fc_ne && !isNaN(parseFloat(row.fc_ne)) && parseFloat(row.fc_ne) > 0) {
+                        return parseFloat(row.fc_ne);
+                    }
                     return (row.niche_price && !isNaN(parseFloat(row.niche_price))) ? parseFloat(row.niche_price) : 0;
+                }
+                if (isFC && row.fc_gp && !isNaN(parseFloat(row.fc_gp)) && parseFloat(row.fc_gp) > 0) {
+                    return parseFloat(row.fc_gp);
                 }
                 return (row.gp_price && !isNaN(parseFloat(row.gp_price))) ? parseFloat(row.gp_price) : 0;
             })(),

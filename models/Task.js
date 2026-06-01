@@ -237,6 +237,8 @@ class Task {
                     ns.traffic_source as website_traffic,
                     ns.gp_price as website_gp_price,
                     ns.niche_edit_price as website_niche_price,
+                    ns.fc_gp as website_fc_gp_price,
+                    ns.fc_ne as website_fc_niche_price,
                     v.name as blogger_name,
                     v.id as vendor_id
              FROM new_order_process_details nopd
@@ -249,15 +251,22 @@ class Task {
         const detail = detailsResult.rows[0] || {};
 
         // Map all details to selected_websites array
-        const selected_websites = detailsResult.rows.map(row => ({
+        const isFC = Number(order.fc) === 1;
+        const selected_websites = detailsResult.rows.map(row => {
+            // Use FC prices when order is FC and FC price is available
+            const gpPrice = (isFC && row.website_fc_gp_price && parseFloat(row.website_fc_gp_price) > 0)
+                ? row.website_fc_gp_price : row.website_gp_price;
+            const nichePrice = (isFC && row.website_fc_niche_price && parseFloat(row.website_fc_niche_price) > 0)
+                ? row.website_fc_niche_price : row.website_niche_price;
+            return {
             id: row.id,
             website_id: row.new_site_id,
             domain_url: row.website_domain,
             dr: row.website_dr,
             da: row.website_da,
             traffic: row.website_traffic,
-            gp_price: row.website_gp_price,
-            niche_price: row.website_niche_price,
+            gp_price: gpPrice,
+            niche_price: nichePrice,
             notes: row.note,
             copy_url: row.doc_urls || row.url,  // Copy URLs from team
             post_url: row.doc_urls,             // Post URL for Niche Edit
@@ -279,7 +288,8 @@ class Task {
             status: Number(row.status),
             fill_details: row.fill_details || false,
             is_rejected: Number(row.status) === 11 // Pass the rejected status natively, type-safe
-        }));
+        };
+        });
 
         return {
             id: order.id,
