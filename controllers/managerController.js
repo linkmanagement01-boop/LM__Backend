@@ -3261,7 +3261,7 @@ const pushClientOrderToBlogger = async (req, res, next) => {
 
         // Get the order details
         const detailsResult = await query(
-            `SELECT cod.*, ns.root_domain, ns.uploaded_user_id as vendor_id, ns.gp_price, ns.niche_edit_price
+            `SELECT cod.*, ns.root_domain, ns.uploaded_user_id as vendor_id, ns.email as site_email, ns.gp_price, ns.niche_edit_price
              FROM client_order_details cod 
              LEFT JOIN new_sites ns ON ns.id = cod.site_id 
              WHERE cod.client_order_id = $1`,
@@ -3272,9 +3272,17 @@ const pushClientOrderToBlogger = async (req, res, next) => {
             return res.status(400).json({ error: 'No sites found in this order' });
         }
 
+        // Resolve correct vendor_id — fallback via case-insensitive email if site is wrongly under admin
+        for (const d of detailsResult.rows) {
+            if ((!d.vendor_id || d.vendor_id === 1) && d.site_email) {
+                const userLookup = await query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id != 1 LIMIT 1', [d.site_email.trim()]);
+                if (userLookup.rows.length > 0) d.vendor_id = userLookup.rows[0].id;
+            }
+        }
+
         // Verify all sites have a vendor
         for (const d of detailsResult.rows) {
-            if (!d.vendor_id) {
+            if (!d.vendor_id || d.vendor_id === 1) {
                 return res.status(400).json({
                     error: `Site "${d.root_domain}" does not have an owner. Cannot push to blogger.`
                 });
@@ -3409,7 +3417,7 @@ const sendClientOrderToWriter = async (req, res, next) => {
 
         // Get the order details
         const detailsResult = await query(
-            `SELECT cod.*, ns.root_domain, ns.uploaded_user_id as vendor_id, ns.gp_price, ns.niche_edit_price
+            `SELECT cod.*, ns.root_domain, ns.uploaded_user_id as vendor_id, ns.email as site_email, ns.gp_price, ns.niche_edit_price
              FROM client_order_details cod 
              LEFT JOIN new_sites ns ON ns.id = cod.site_id 
              WHERE cod.client_order_id = $1`,
@@ -3420,6 +3428,14 @@ const sendClientOrderToWriter = async (req, res, next) => {
             return res.status(400).json({ error: 'No sites found in this order' });
         }
 
+        // Resolve correct vendor_id — fallback via case-insensitive email if site is wrongly under admin
+        for (const d of detailsResult.rows) {
+            if ((!d.vendor_id || d.vendor_id === 1) && d.site_email) {
+                const userLookup = await query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id != 1 LIMIT 1', [d.site_email.trim()]);
+                if (userLookup.rows.length > 0) d.vendor_id = userLookup.rows[0].id;
+            }
+        }
+
         const hasDelegated = detailsResult.rows.some(d => !d.fill_details);
         if (!hasDelegated) {
             return res.status(400).json({ error: 'Only orders containing at least one delegated website can be sent to a writer' });
@@ -3427,7 +3443,7 @@ const sendClientOrderToWriter = async (req, res, next) => {
 
         // Verify all sites have a vendor/owner
         for (const d of detailsResult.rows) {
-            if (!d.vendor_id) {
+            if (!d.vendor_id || d.vendor_id === 1) {
                 return res.status(400).json({
                     error: `Site "${d.root_domain}" does not have an owner. Cannot delegate.`
                 });
