@@ -4,6 +4,7 @@ const logger = require('../utils/logger');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const { sendVerificationCodeEmail } = require('../utils/emailService');
+const { validateSignupEmail } = require('../utils/emailValidation');
 /**
  * Authentication Controller
  * Handles login, logout, and token management
@@ -294,7 +295,11 @@ const sendSignupCode = async (req, res, next) => {
 
         const cleanEmail = email.toLowerCase().trim();
         const { query } = require('../config/database');
-
+        // 0. Reject disposable emails and domains that cannot receive mail
+        const emailCheck = await validateSignupEmail(cleanEmail);
+        if (!emailCheck.ok) {
+            return res.status(400).json({ error: 'Validation Error', message: emailCheck.message });
+        }
         // 1. One account per email (case-insensitive)
         const existing = await query(
             'SELECT id FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1',
