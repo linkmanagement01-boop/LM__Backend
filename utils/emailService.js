@@ -6,6 +6,7 @@
  */
 
 const nodemailer = require('nodemailer');
+const axios = require('axios');
 
 // ─── SMTP Transporter ────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -73,19 +74,39 @@ const wrapHTML = (bodyContent) => `
 </body>
 </html>`;
 
-// ─── Core send function (fire-and-forget) ────────────────────────────
 const sendEmail = async (to, subject, htmlBody) => {
     try {
+        const html = wrapHTML(htmlBody);
+
+        // Railway Hobby blocks SMTP, so use EmailIt's HTTPS API when a key is set
+        if (process.env.EMAILIT_API_KEY) {
+            const fromApi = `LinkManagement <${process.env.FROM_EMAIL || 'contact@linkmanagement.net'}>`;
+            const res = await axios.post(
+                'https://api.emailit.com/v2/emails',
+                { from: fromApi, to, subject, html },
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.EMAILIT_API_KEY}`,
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 15000
+                }
+            );
+            console.log(`📧 Email sent via EmailIt API to ${to} – ${subject} (id: ${res.data?.id || 'n/a'})`);
+            return true;
+        }
+
+        // Fallback: SMTP (works locally, but is blocked on Railway Hobby)
         const info = await transporter.sendMail({
             from: FROM,
             to,
             subject,
-            html: wrapHTML(htmlBody)
+            html
         });
         console.log(`📧 Email sent to ${to} – ${subject} (messageId: ${info.messageId})`);
         return true;
     } catch (err) {
-        console.error(`❌ Email FAILED to ${to} – ${subject}:`, err.message);
+        console.error(`❌ Email FAILED to ${to} – ${subject}:`, err.response?.data || err.message);
         return false;
     }
 };
