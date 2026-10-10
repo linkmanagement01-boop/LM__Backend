@@ -182,10 +182,34 @@ const sendPaymentApprovedEmail = (bloggerEmail, bloggerName, amount, remarks) =>
     `;
     sendEmail(bloggerEmail, subject, body);
 };
+const escapeHtml = (s = '') => String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+/**
+ * 4. Signup verification code (awaited, so the caller knows if it failed)
+ */
+const sendVerificationCodeEmail = (to, name, code) => {
+    const subject = 'Verify your email – LinkManagement';
+    const body = `
+    <h2>Hello ${escapeHtml(name) || 'there'},</h2>
+    <p>Use this code to finish creating your LinkManagement account:</p>
+
+    <div class="highlight-box" style="text-align:center;">
+      <p class="label">Verification Code</p>
+      <p class="value" style="font-size:34px; letter-spacing:8px;">${escapeHtml(code)}</p>
+    </div>
+
+    <p>This code expires in <strong>10 minutes</strong>. If you didn't try to sign up, you can ignore this email.</p>
+    `;
+    return sendEmail(to, subject, body);
+};
 
 module.exports = {
     sendEmail,
     sendSiteAddedEmail,
     sendOrderAssignedEmail,
-    sendPaymentApprovedEmail
+    sendPaymentApprovedEmail,
+    sendVerificationCodeEmail
 };
+

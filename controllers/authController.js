@@ -1,7 +1,9 @@
 const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const logger = require('../utils/logger');
-
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const { sendVerificationCodeEmail } = require('../utils/emailService');
 /**
  * Authentication Controller
  * Handles login, logout, and token management
@@ -261,6 +263,192 @@ const register = async (req, res, next) => {
         next(error);
     }
 };
+
+/**
+ * @route   POST /api/auth/register/send-code
+ * @desc    Step 1 of signup: validate details, email a 6-digit code
+ * @access  Public
+ */
+const sendSignupCode = async (req, res, next) => {
+    try {
+        const { name, email, password, confirm_password, whatsapp, skype } = req.body;
+
+        if (!name || name.trim().length < 2) {
+            return res.status(400).json({ error: 'Validation Error', message: 'Name is required and must be at least 2 characters' });
+        }
+        if (!email || !email.includes('@')) {
+            return res.status(400).json({ error: 'Validation Error', message: 'Valid email address is required' });
+        }
+        if (!password || password.length < 8) {
+            return res.status(400).json({ error: 'Validation Error', message: 'Password must be at least 8 characters' });
+        }
+        if (password !== confirm_password) {
+            return res.status(400).json({ error: 'Validation Error', message: 'Passwords do not match' });
+        }
+        if (!whatsapp || whatsapp.trim().length === 0) {
+            return res.status(400).json({ error: 'Validation Error', message: 'WhatsApp number is required' });
+        }
+        if (!skype || skype.trim().length === 0) {
+            return res.status(400).json({ error: 'Validation Error', message: 'Skype ID is required' });
+        }
+
+        const cleanEmail = email.toLowerCase().trim();
+        const { query } = require('../config/database');
+
+        // 1. One account per email (case-insensitive)
+        const existing = await query(
+            'SELECT id FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1',
+            [cleanEmail]
+        );
+        if (existing.rows.length > 0) {
+            return res.status(409).json({ error: 'Conflict', message: 'Email already registered' });
+        }
+
+        // 2. Resend cooldown: one code per 60 seconds per email
+        const pending = await query(
+            `SELECT EXTRACT(EPOCH FROM (NOW() - last_sent_at)) AS seconds_since
+             FROM pending_signups WHERE LOWER(email) = LOWER($1)`,
+            [cleanEmail]
+        );
+        if (pending.rows.length > 0 && Number(pending.rows[0].seconds_since) < 60) {
+            const wait = Math.ceil(60 - Number(pending.rows[0].seconds_since));
+            return res.status(429).json({
+                error: 'Too Many Requests',
+                message: `Please wait ${wait} seconds before requesting another code`
+            });
+        }
+
+        // 3. Create code + store pending signup (code and password are stored hashed)
+        const code = String(crypto.randomInt(100000, 1000000));
+        const codeHash = await bcrypt.hash(code, 10);
+        const passwordHash = await bcrypt.hash(password, 10);
+
+        await query('DELETE FROM pending_signups WHERE LOWER(email) = LOWER($1)', [cleanEmail]);
+        await query(
+            `INSERT INTO pending_signups
+               (email, name, whatsapp, skype, password_hash, code_hash, attempts, expires_at, last_sent_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 0, NOW() + INTERVAL '10 minutes', NOW())`,
+            [cleanEmail, name.trim(), whatsapp.trim(), skype.trim(), passwordHash, codeHash]
+        );
+
+        // 4. Send the email (local dev without SMTP: print the code in the terminal instead)
+        const onRailway = !!(process.env.RAILWAY_ENVIRONMENT_NAME || process.env.RAILWAY_PROJECT_ID);
+        const devMode = !onRailway && process.env.NODE_ENV === 'development' && !process.env.SMTP_PASSWORD;
+
+        if (devMode) {
+            console.log(`🔑 [DEV ONLY] Verification code for ${cleanEmail}: ${code}`);
+        } else {
+            const sent = await sendVerificationCodeEmail(cleanEmail, name.trim(), code);
+            if (!sent) {
+                await query('DELETE FROM pending_signups WHERE LOWER(email) = LOWER($1)', [cleanEmail]);
+                return res.status(500).json({
+                    error: 'Email Failed',
+                    message: 'Could not send the verification email. Please try again later.'
+                });
+            }
+        }
+
+        logger.info('Auth', `Signup verification code sent to: ${cleanEmail}`);
+        res.json({ message: 'Verification code sent', expires_in_minutes: 10 });
+
+    } catch (error) {
+        logger.error('Auth:SendSignupCode', error, { email: req.body?.email });
+        next(error);
+    }
+};
+
+/**
+ * @route   POST /api/auth/register/verify
+ * @desc    Step 2 of signup: check the code, then create the account
+ * @access  Public
+ */
+const verifySignupCode = async (req, res, next) => {
+    try {
+        const { email, code } = req.body;
+
+        if (!email || !email.includes('@')) {
+            return res.status(400).json({ error: 'Validation Error', message: 'Valid email address is required' });
+        }
+        if (!code || !/^\d{6}$/.test(String(code).trim())) {
+            return res.status(400).json({ error: 'Validation Error', message: 'Enter the 6-digit code from your email' });
+        }
+
+        const cleanEmail = email.toLowerCase().trim();
+        const { query } = require('../config/database');
+
+        const result = await query(
+            'SELECT * FROM pending_signups WHERE LOWER(email) = LOWER($1)',
+            [cleanEmail]
+        );
+        if (result.rows.length === 0) {
+            return res.status(400).json({ error: 'Validation Error', message: 'No pending signup found. Please start again.' });
+        }
+        const pending = result.rows[0];
+
+        if (new Date(pending.expires_at) < new Date()) {
+            await query('DELETE FROM pending_signups WHERE id = $1', [pending.id]);
+            return res.status(400).json({ error: 'Validation Error', message: 'This code has expired. Please start again.' });
+        }
+
+        if (pending.attempts >= 5) {
+            await query('DELETE FROM pending_signups WHERE id = $1', [pending.id]);
+            return res.status(429).json({ error: 'Too Many Attempts', message: 'Too many wrong attempts. Please start again.' });
+        }
+
+        const codeOk = await bcrypt.compare(String(code).trim(), pending.code_hash);
+        if (!codeOk) {
+            const attemptsNow = pending.attempts + 1;
+            if (attemptsNow >= 5) {
+                await query('DELETE FROM pending_signups WHERE id = $1', [pending.id]);
+                return res.status(429).json({ error: 'Too Many Attempts', message: 'Too many wrong attempts. Please start again.' });
+            }
+            await query('UPDATE pending_signups SET attempts = $1 WHERE id = $2', [attemptsNow, pending.id]);
+            return res.status(400).json({
+                error: 'Validation Error',
+                message: `Incorrect code. ${5 - attemptsNow} attempt(s) left.`
+            });
+        }
+
+        // Code is correct: create the real account (only if the email is still free)
+        const created = await query(
+            `INSERT INTO users (name, email, password, whatsapp, skype, role, status, created_at, updated_at)
+             SELECT $1::text, $2::text, $3::text, $4::text, $5::text, 'vendor', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+             WHERE NOT EXISTS (SELECT 1 FROM users WHERE LOWER(email) = LOWER($2::text))
+             RETURNING id, name, email, role, created_at`,
+            [pending.name, pending.email, pending.password_hash, pending.whatsapp, pending.skype]
+        );
+
+        if (created.rows.length === 0) {
+            await query('DELETE FROM pending_signups WHERE id = $1', [pending.id]);
+            return res.status(409).json({ error: 'Conflict', message: 'Email already registered' });
+        }
+
+        const newUser = created.rows[0];
+
+        try {
+            await query(
+                `INSERT INTO wallets (user_id, balance, created_at, updated_at)
+                 VALUES ($1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                [newUser.id]
+            );
+        } catch (walletError) {
+            logger.warn('Auth', `Wallet creation skipped for user ${newUser.id}: ${walletError.message}`);
+        }
+
+        await query('DELETE FROM pending_signups WHERE id = $1', [pending.id]);
+
+        logger.success('Auth', { message: 'User registered with verified email', userId: newUser.id });
+
+        res.status(201).json({
+            message: 'Account created successfully! You can now sign in.',
+            user: { id: newUser.id, name: newUser.name, email: newUser.email, role: newUser.role }
+        });
+
+    } catch (error) {
+        logger.error('Auth:VerifySignupCode', error, { email: req.body?.email });
+        next(error);
+    }
+};
 /**
  * @route   PUT /api/auth/change-password
  * @desc    Change current user's password
@@ -364,6 +552,8 @@ module.exports = {
     logout,
     getCurrentUser,
     register,
+    sendSignupCode,
+    verifySignupCode,
     changePassword,
     getMyPermissions
 };
