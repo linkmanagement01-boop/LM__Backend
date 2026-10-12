@@ -74,7 +74,18 @@ const wrapHTML = (bodyContent) => `
 </body>
 </html>`;
 
-const sendEmail = async (to, subject, htmlBody) => {
+// Some stored addresses are messy ("a@x.com, b@y.com", stray spaces) – pick the first valid one
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const normalizeRecipient = (raw) => String(raw || '')
+    .split(/[\s,;]+/)
+    .find(part => EMAIL_RE.test(part)) || null;
+
+const sendEmail = async (rawTo, subject, htmlBody) => {
+    const to = normalizeRecipient(rawTo);
+    if (!to) {
+        console.error(`❌ Email SKIPPED – invalid recipient "${rawTo}" – ${subject}`);
+        return false;
+    }
     try {
         const html = wrapHTML(htmlBody);
 

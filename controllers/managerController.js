@@ -2044,6 +2044,18 @@ nopd.id as detail_id,
             });
         }
 
+        // Resolve correct owner — fallback via case-insensitive email if site is wrongly under admin
+        for (const detail of details.rows) {
+            if ((!detail.site_owner_id || detail.site_owner_id === 1) && detail.site_email) {
+                const userLookup = await query('SELECT id, name, email FROM users WHERE LOWER(email) = LOWER($1) AND id != 1 LIMIT 1', [detail.site_email.trim()]);
+                if (userLookup.rows.length > 0) {
+                    detail.site_owner_id = userLookup.rows[0].id;
+                    detail.owner_name = userLookup.rows[0].name;
+                    detail.owner_email = userLookup.rows[0].email;
+                }
+            }
+        }
+
         // Auto-route each site to its owner
         const pushedTasks = [];
         for (const detail of details.rows) {
@@ -2078,7 +2090,8 @@ VALUES(gen_random_uuid(), 'order_assigned', 'App\\Models\\User', $1, $2, CURRENT
                 root_domain: detail.root_domain,
                 vendor_id: detail.site_owner_id,
                 vendor_name: detail.owner_name,
-                vendor_email: detail.site_email || detail.owner_email
+                // Never send the blogger email to the admin account
+                vendor_email: detail.site_email || (detail.site_owner_id && detail.site_owner_id !== 1 ? detail.owner_email : null)
             });
         }
 
@@ -2628,9 +2641,13 @@ const createOrderChain = async (req, res, next) => {
                 const grouped = {};
                 for (const w of websites) {
                     const siteResult = await query('SELECT uploaded_user_id, root_domain, email as site_email FROM new_sites WHERE id = $1', [w.id]);
-                    const vendorId = siteResult.rows[0]?.uploaded_user_id;
+                    let vendorId = siteResult.rows[0]?.uploaded_user_id;
                     const siteEmail = siteResult.rows[0]?.site_email;
-                    if (!vendorId) continue;
+                    if ((!vendorId || vendorId === 1) && siteEmail) {
+                        const userLookup = await query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id != 1 LIMIT 1', [siteEmail.trim()]);
+                        if (userLookup.rows.length > 0) vendorId = userLookup.rows[0].id;
+                    }
+                    if (!vendorId || vendorId === 1) continue;
                     
                     const userResult = await query('SELECT name, email FROM users WHERE id = $1', [vendorId]);
                     const ownerEmail = userResult.rows[0]?.email;
