@@ -182,7 +182,7 @@ const sendOrderAssignedEmail = (bloggerEmail, bloggerName, tasks) => {
 
     <p>Please complete your tasks within the standard turnaround time. If you have any questions, contact your manager.</p>
 
-    <a href="https://www.linkmanagement.net/blogger/tasks" class="btn">View My Tasks →</a>
+    <a href="https://www.linkmanagement.net/login" class="btn">View My Tasks →</a>
     `;
     sendEmail(bloggerEmail, subject, body);
 };
