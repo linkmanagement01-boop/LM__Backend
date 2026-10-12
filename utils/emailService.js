@@ -142,7 +142,7 @@ const sendSiteAddedEmail = (bloggerEmail, bloggerName, siteDomain) => {
 
     <p>Your site is now in our system and will be considered for upcoming link-building orders once approved. You'll receive a notification when new tasks are assigned to your site.</p>
 
-    <a href="https://www.linkmanagement.net/blogger/sites" class="btn">View My Sites →</a>
+    <a href="https://www.linkmanagement.net/login" class="btn">View My Sites →</a>
     `;
     // Fire-and-forget — don't await
     sendEmail(bloggerEmail, subject, body);
@@ -210,7 +210,7 @@ const sendPaymentApprovedEmail = (bloggerEmail, bloggerName, amount, remarks) =>
 
     <p>The funds will be transferred to your registered payment method. Please allow up to 3-5 business days for the amount to reflect in your account.</p>
 
-    <a href="https://www.linkmanagement.net/blogger/wallet" class="btn">View Wallet →</a>
+    <a href="https://www.linkmanagement.net/login" class="btn">View Wallet →</a>
     `;
     sendEmail(bloggerEmail, subject, body);
 };
