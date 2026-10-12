@@ -168,7 +168,7 @@ const getOrders = async (req, res, next) => {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 50;
         const offset = (page - 1) * limit;
-        const { status, search, client_name, client_website, category, order_id, manager_id, ordered_at_from, ordered_at_to } = req.query;
+        const { status, search, order_type, client_name, client_website, category, order_id, manager_id, ordered_at_from, ordered_at_to } = req.query;
 
         let whereClauses = [];
         let params = [];
@@ -180,10 +180,19 @@ const getOrders = async (req, res, next) => {
             paramIndex++;
         }
 
-        if (search) {
+        // Order IDs are shown as "#AT102", so ignore a leading '#'
+        const searchTerm = (search || '').trim().replace(/^#/, '');
+        if (searchTerm) {
             whereClauses.push(`(order_id ILIKE $${paramIndex} OR client_name ILIKE $${paramIndex} OR manager_name ILIKE $${paramIndex} OR client_website ILIKE $${paramIndex})`);
-            params.push(`%${search}%`);
+            params.push(`%${searchTerm}%`);
             paramIndex++;
+        }
+
+        // order_type is stored as both 'gp'/'niche' and 'Guest Post'/'Niche Edit'
+        if (order_type === 'gp') {
+            whereClauses.push(`(order_type ILIKE 'gp' OR order_type ILIKE 'guest%')`);
+        } else if (order_type === 'niche') {
+            whereClauses.push(`order_type ILIKE 'niche%'`);
         }
 
         if (client_name) {
@@ -249,6 +258,7 @@ const getOrders = async (req, res, next) => {
                          JOIN new_sites ns ON nopd.new_site_id = ns.id 
                          WHERE nop.new_order_id = o.id LIMIT 1)
                     )::varchar as client_website,
+                    o.order_type::varchar,
                     o.category::text,
                     o.manager_id::integer,
                     m.name::varchar as manager_name,
@@ -271,6 +281,7 @@ const getOrders = async (req, res, next) => {
                     ('CLT-PRV-' || co.id)::varchar as order_id,
                     u.name::varchar as client_name,
                     (SELECT ns.root_domain FROM client_order_details cod LEFT JOIN new_sites ns ON ns.id = cod.site_id WHERE cod.client_order_id = co.id LIMIT 1)::varchar as client_website,
+                    co.order_type::varchar,
                     co.category::text,
                     co.assigned_to::integer as manager_id,
                     am.name::varchar as manager_name,
@@ -364,11 +375,15 @@ const getOrders = async (req, res, next) => {
             )
             SELECT * FROM combined_orders
             ${whereSql}
-            ORDER BY created_at DESC
+            ORDER BY ${searchTerm
+                ? `CASE WHEN LOWER(order_id) = LOWER($${paramIndex + 2}) THEN 0 WHEN order_id ILIKE $${paramIndex + 2} || '%' THEN 1 ELSE 2 END,`
+                : ''} created_at DESC
             LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
         `;
 
-        const ordersResult = await query(ordersQuery, [...params, limit, offset]);
+        // When searching, exact order ID matches come first, then IDs starting with the term
+        const ordersParams = searchTerm ? [...params, limit, offset, searchTerm] : [...params, limit, offset];
+        const ordersResult = await query(ordersQuery, ordersParams);
 
         res.json({
             total,
