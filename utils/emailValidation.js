@@ -18,18 +18,13 @@ const withTimeout = (promise, ms) =>
 // Anything else (timeout, server error) is treated as temporary, so a real user is not blocked.
 const isNotFound = (err) => err && (err.code === 'ENOTFOUND' || err.code === 'ENODATA');
 
-// Domains you add yourself, comma separated, e.g. EXTRA_BLOCKED_EMAIL_DOMAINS=baddomain.com,other.net
-const getExtraBlockedDomains = () =>
-    (process.env.EXTRA_BLOCKED_EMAIL_DOMAINS || '')
+// Reads a comma separated environment variable into a clean list
+const parseList = (value) =>
+    String(value || '')
         .split(',')
-        .map((d) => d.trim().toLowerCase())
+        .map((s) => s.trim().toLowerCase().replace(/\.$/, ''))
         .filter(Boolean);
-// Mail server hostnames of disposable services, comma separated, e.g. EXTRA_BLOCKED_MX_HOSTS=mail.tempservice.com
-const getExtraBlockedMxHosts = () =>
-    (process.env.EXTRA_BLOCKED_MX_HOSTS || '')
-        .split(',')
-        .map((d) => d.trim().toLowerCase().replace(/\.$/, ''))
-        .filter(Boolean);
+
 // Live check against Kickbox's free disposable-domain list (kept up to date).
 // If the service is slow or down, we do not block the user.
 const isDisposableOnline = async (domain) => {
@@ -49,6 +44,11 @@ const isDisposableOnline = async (domain) => {
 /**
  * Checks a signup email.
  * Returns { ok: true } or { ok: false, message: '...' }
+ *
+ * Railway variables you can set (all optional, comma separated):
+ *   EXTRA_BLOCKED_EMAIL_DOMAINS  domains to block, e.g. baddomain.com
+ *   EXTRA_BLOCKED_MX_HOSTS       mail server names of disposable services
+ *   EXTRA_BLOCKED_MX_IPS         mail server IP addresses of disposable services
  */
 const validateSignupEmail = async (rawEmail) => {
     const email = String(rawEmail || '').toLowerCase().trim();
@@ -61,7 +61,7 @@ const validateSignupEmail = async (rawEmail) => {
     const domain = email.split('@')[1];
 
     // 2. Domains you blocked yourself
-    if (getExtraBlockedDomains().includes(domain)) {
+    if (parseList(process.env.EXTRA_BLOCKED_EMAIL_DOMAINS).includes(domain)) {
         return { ok: false, message: DISPOSABLE_MESSAGE };
     }
 
@@ -75,19 +75,32 @@ const validateSignupEmail = async (rawEmail) => {
         return { ok: false, message: DISPOSABLE_MESSAGE };
     }
 
-    // 5. The domain must exist and be able to receive mail
+    // 5. The domain must exist, be able to receive mail, and not use a blocked mail server
+    const blockedMxHosts = parseList(process.env.EXTRA_BLOCKED_MX_HOSTS);
+    const blockedMxIps = parseList(process.env.EXTRA_BLOCKED_MX_IPS);
+
     try {
         const mx = await withTimeout(dns.resolveMx(domain), 4000);
+        const realMx = mx.filter((r) => r.exchange && r.exchange !== '.');
 
-        // Mail servers of known disposable services (one service can own thousands of changing domains)
-        const blockedMxHosts = getExtraBlockedMxHosts();
-        const usesBlockedMx = mx.some((r) => {
-            const host = String(r.exchange || '').toLowerCase().replace(/\.$/, '');
+        // Mail server names that belong to disposable services
+        const usesBlockedHost = realMx.some((r) => {
+            const host = r.exchange.toLowerCase().replace(/\.$/, '');
             return blockedMxHosts.some((b) => host === b || host.endsWith('.' + b));
         });
-        if (usesBlockedMx) return { ok: false, message: DISPOSABLE_MESSAGE };
+        if (usesBlockedHost) return { ok: false, message: DISPOSABLE_MESSAGE };
 
-        if (mx.some((r) => r.exchange && r.exchange !== '.')) return { ok: true };
+        // Mail servers whose IP address belongs to a disposable service
+        if (blockedMxIps.length > 0) {
+            for (const r of realMx.slice(0, 5)) {
+                const ips = await withTimeout(dns.resolve4(r.exchange), 3000).catch(() => []);
+                if (ips.some((ip) => blockedMxIps.includes(ip))) {
+                    return { ok: false, message: DISPOSABLE_MESSAGE };
+                }
+            }
+        }
+
+        if (realMx.length > 0) return { ok: true };
     } catch (err) {
         if (!isNotFound(err)) return { ok: true };
     }
@@ -95,6 +108,9 @@ const validateSignupEmail = async (rawEmail) => {
     // No MX records: mail servers fall back to the domain's address record
     try {
         const addresses = await withTimeout(dns.resolve4(domain), 4000);
+        if (addresses.some((ip) => blockedMxIps.includes(ip))) {
+            return { ok: false, message: DISPOSABLE_MESSAGE };
+        }
         if (addresses.length > 0) return { ok: true };
     } catch (err) {
         if (!isNotFound(err)) return { ok: true };
