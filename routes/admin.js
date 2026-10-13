@@ -67,6 +67,7 @@ router.post('/users/:id/wallet/withdraw', adminController.withdrawManualWalletBa
 
 // ==================== BLOGGER PERFORMANCE ====================
 router.get('/bloggers/:id/performance', adminController.getBloggerPerformance);
+router.delete('/bloggers/:id', adminController.deleteBlogger);
 
 // ==================== WEBSITE MANAGEMENT ====================
 router.get('/websites', adminController.getAllWebsites);
