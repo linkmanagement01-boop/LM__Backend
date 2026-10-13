@@ -3741,6 +3741,20 @@ const deleteBlogger = async (req, res, next) => {
     }
 };
 
+/**
+ * @route   GET /api/admin/bloggers/:id/delete-blockers
+ * @desc    Why a blogger can't be deleted (shown when hovering the grey delete icon)
+ * @access  Admin only
+ */
+const getBloggerDeleteBlockers = async (req, res, next) => {
+    try {
+        const blockers = await getDeletionBlockers(req.params.id);
+        res.json({ can_delete: blockers.length === 0, blockers });
+    } catch (error) {
+        next(error);
+    }
+};
+
 const getBloggerPerformance = async (req, res, next) => {
     try {
         const { id } = req.params;
@@ -4246,6 +4260,7 @@ module.exports = {
     // Blogger Performance
     getBloggerPerformance,
     deleteBlogger,
+    getBloggerDeleteBlockers,
     // Profile Management
     getProfile,
     updateProfile,
