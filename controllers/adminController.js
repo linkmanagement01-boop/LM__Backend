@@ -11,7 +11,7 @@ const logger = require('../utils/logger');
 const PDFDocument = require('pdfkit');
 const jwt = require('jsonwebtoken');
 const { sendPaymentApprovedEmail } = require('../utils/emailService');
-const { activeSiteSql, activeBloggerSql, getDeactivationBlockers } = require('../utils/bloggerStatus');
+const { activeSiteSql, activeBloggerSql, getDeactivationBlockers, canDeleteBloggerSql, getDeletionBlockers, deleteBloggerData } = require('../utils/bloggerStatus');
 
 // Configure multer for file uploads
 const upload = multer({ dest: 'uploads/' });
@@ -149,6 +149,12 @@ const deleteUser = async (req, res, next) => {
                 error: 'Bad Request',
                 message: 'Cannot delete your own account'
             });
+        }
+
+        // Bloggers go through the safe delete (checks + removes their sites etc.)
+        const target = await User.findById(id);
+        if (target && ['vendor', 'blogger'].includes(String(target.role || '').toLowerCase())) {
+            return deleteBlogger(req, res, next);
         }
 
         const user = await User.delete(id);
@@ -3211,7 +3217,8 @@ const getBloggerStats = async (req, res, next) => {
         // Get bloggers with stats
         const result = await query(`
             SELECT 
-                u.id, u.name, u.email, u.status as is_active, 
+                u.id, u.name, u.email, u.status as is_active,
+                ${canDeleteBloggerSql('u.id')} as can_delete,
                 u.last_login, u.login_count, u.created_at,
                 COALESCE(
                     (SELECT SUM(
@@ -3697,6 +3704,43 @@ const updateUserPermissions = async (req, res, next) => {
  * @desc    Get performance stats for a specific blogger
  * @access  Admin only
  */
+/**
+ * @route   DELETE /api/admin/bloggers/:id
+ * @desc    Permanently delete a blogger who never did any work (e.g. spam signups).
+ *          Refused if they have any order, payment or wallet history.
+ * @access  Admin only
+ */
+const deleteBlogger = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+
+        const userResult = await query(`SELECT id, name, email, role FROM users WHERE id = $1`, [id]);
+        const blogger = userResult.rows[0];
+        if (!blogger || !['vendor', 'blogger'].includes(String(blogger.role || '').toLowerCase())) {
+            return res.status(404).json({ error: 'Not Found', message: 'Blogger not found' });
+        }
+
+        const blockers = await getDeletionBlockers(blogger.id);
+        if (blockers.length > 0) {
+            return res.status(400).json({
+                error: 'Cannot Delete',
+                message: `${blogger.name || 'This blogger'} cannot be deleted. ${blockers.join(' ')} Use "Inactive" instead if you want to hide this blogger.`,
+                blockers
+            });
+        }
+
+        const removed = await deleteBloggerData(blogger.id);
+        logger.info('Admin', `Blogger deleted by admin ${req.user.id}: #${blogger.id} ${blogger.email} – ${JSON.stringify(removed)}`);
+
+        res.json({
+            message: `${blogger.name || 'Blogger'} has been deleted`,
+            removed
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
 const getBloggerPerformance = async (req, res, next) => {
     try {
         const { id } = req.params;
@@ -4201,6 +4245,7 @@ module.exports = {
     impersonateUser,
     // Blogger Performance
     getBloggerPerformance,
+    deleteBlogger,
     // Profile Management
     getProfile,
     updateProfile,

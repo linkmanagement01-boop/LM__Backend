@@ -39,11 +39,12 @@ const authenticate = async (req, res, next) => {
         if (String(decoded.role || '').toLowerCase() === 'blogger') {
             // A failed lookup must not log the blogger out, so treat it as "still active"
             const statusResult = await query('SELECT status FROM users WHERE id = $1', [decoded.id])
-                .catch(err => { console.error('Blogger status check failed:', err.message); return { rows: [] }; });
-            if (statusResult.rows[0] && statusResult.rows[0].status === 0) {
+                .catch(err => { console.error('Blogger status check failed:', err.message); return null; });
+            // Signed out if the account was deactivated or deleted
+            if (statusResult && (!statusResult.rows[0] || statusResult.rows[0].status === 0)) {
                 return res.status(401).json({
                     error: 'Unauthorized',
-                    message: 'Your account has been deactivated. Please contact the administrator.'
+                    message: statusResult.rows[0] ? 'Your account has been deactivated. Please contact the administrator.' : 'Your account no longer exists.'
                 });
             }
         }
