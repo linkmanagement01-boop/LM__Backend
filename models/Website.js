@@ -1,4 +1,5 @@
 const { query } = require('../config/database');
+const { activeSiteSql } = require('../utils/bloggerStatus');
 
 /**
  * Website Model - Production Database Compatible
@@ -33,7 +34,7 @@ class Website {
                 u.name as blogger_name
             FROM new_sites ns
             LEFT JOIN users u ON ns.uploaded_user_id = u.id
-            WHERE 1=1
+            WHERE ${activeSiteSql('ns')}
         `;
         const params = [];
         let paramIndex = 1;

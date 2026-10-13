@@ -1,4 +1,5 @@
 const { query } = require('../config/database');
+const { activeBloggerSql } = require('../utils/bloggerStatus');
 
 /**
  * Transaction Model - Production Database Compatible
@@ -45,7 +46,7 @@ class Transaction {
                 ), 0) as amount
             FROM withdraw_requests wr
             JOIN users u ON wr.user_id = u.id
-            WHERE 1=1
+            WHERE ${activeBloggerSql('wr.user_id')}
         `;
 
         const params = [];

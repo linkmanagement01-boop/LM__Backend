@@ -1,4 +1,5 @@
 const { query } = require('../config/database');
+const { activeSiteSql, activeBloggerSql, findInactiveBloggerSites, inactiveSitesMessage } = require('../utils/bloggerStatus');
 const logger = require('../utils/logger');
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -305,7 +306,7 @@ const getSites = async (req, res, next) => {
 
         // Build dynamic WHERE conditions as an array
         // Enforce approved/active status only for clients
-        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0) AND ns.site_status = '1'`];
+        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0) AND ns.site_status = '1'`, activeSiteSql('ns')];
         const queryParams = [];
         let paramIndex = 1;
 
@@ -436,6 +437,11 @@ const createOrder = async (req, res, next) => {
                 error: 'Validation Error',
                 message: 'Order type and at least one website are required'
             });
+        }
+
+        const inactiveSites = await findInactiveBloggerSites(websites.map(w => w.site_id));
+        if (inactiveSites.length > 0) {
+            return res.status(400).json({ error: 'Validation Error', message: inactiveSitesMessage(inactiveSites) });
         }
 
         // 1. Calculate total price and per-site marked-up prices

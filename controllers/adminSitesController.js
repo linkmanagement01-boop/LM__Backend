@@ -1,4 +1,5 @@
 const pool = require('../config/database');
+const { activeBloggerSql } = require('../utils/bloggerStatus');
 const axios = require('axios');
 const cheerio = require('cheerio');
 
@@ -26,7 +27,7 @@ const getCompletedLinks = async (req, res, next) => {
         const offset = (page - 1) * limit;
 
         // Build WHERE clause - links where blogger has submitted (submit_url is filled)
-        let whereClause = `WHERE nopd.submit_url IS NOT NULL AND nopd.submit_url != ''`;
+        let whereClause = `WHERE nopd.submit_url IS NOT NULL AND nopd.submit_url != '' AND ${activeBloggerSql('nopd.vendor_id')}`;
         const params = [];
 
         if (year) {

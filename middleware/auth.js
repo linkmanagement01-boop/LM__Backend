@@ -1,10 +1,11 @@
 const jwt = require('jsonwebtoken');
+const { query } = require('../config/database');
 
 /**
  * JWT Authentication Middleware
  * Verifies JWT token and attaches user info to request
  */
-const authenticate = (req, res, next) => {
+const authenticate = async (req, res, next) => {
     try {
         // Get token from header or query parameter (for file downloads)
         const authHeader = req.headers.authorization;
@@ -33,6 +34,19 @@ const authenticate = (req, res, next) => {
             email: decoded.email,
             role: decoded.role
         };
+
+        // An inactive blogger is signed out straight away, even with a still-valid token
+        if (String(decoded.role || '').toLowerCase() === 'blogger') {
+            // A failed lookup must not log the blogger out, so treat it as "still active"
+            const statusResult = await query('SELECT status FROM users WHERE id = $1', [decoded.id])
+                .catch(err => { console.error('Blogger status check failed:', err.message); return { rows: [] }; });
+            if (statusResult.rows[0] && statusResult.rows[0].status === 0) {
+                return res.status(401).json({
+                    error: 'Unauthorized',
+                    message: 'Your account has been deactivated. Please contact the administrator.'
+                });
+            }
+        }
 
         next();
     } catch (error) {
