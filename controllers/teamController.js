@@ -1,6 +1,7 @@
 const Task = require('../models/Task');
 const Website = require('../models/Website');
 const { query } = require('../config/database');
+const { activeSiteSql, activeBloggerSql, findInactiveBloggerSites, inactiveSitesMessage } = require('../utils/bloggerStatus');
 
 /**
  * Team Controller - Production Database Compatible
@@ -96,6 +97,11 @@ const submitWebsite = async (req, res, next) => {
                 error: 'Validation Error',
                 message: 'Invalid website ID'
             });
+        }
+
+        const inactiveSites = await findInactiveBloggerSites([website_id]);
+        if (inactiveSites.length > 0) {
+            return res.status(400).json({ error: 'Validation Error', message: inactiveSitesMessage(inactiveSites) });
         }
 
         // Submit website selection to manager
@@ -205,7 +211,7 @@ const getWebsites = async (req, res, next) => {
         const categoryFilter = req.query.category || '';
 
         // Build WHERE conditions
-        let whereConditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`, `ns.site_status = '1'`];
+        let whereConditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`, `ns.site_status = '1'`, activeSiteSql('ns')];
         let params = [];
         let paramIndex = 1;
 
@@ -469,6 +475,11 @@ const submitWebsitesToManager = async (req, res, next) => {
             });
         }
 
+        const inactiveSites = await findInactiveBloggerSites(website_ids);
+        if (inactiveSites.length > 0) {
+            return res.status(400).json({ error: 'Validation Error', message: inactiveSitesMessage(inactiveSites) });
+        }
+
         // Get current task
         const task = await Task.findById(id);
         if (!task) {
@@ -590,7 +601,7 @@ const getCompletedOrders = async (req, res, next) => {
             JOIN new_orders no ON nop.new_order_id = no.id
             LEFT JOIN users m ON nop.manager_id = m.id
             LEFT JOIN users t ON nop.team_id = t.id
-            WHERE nop.team_id = $1 
+            WHERE nop.team_id = $1 AND ${activeBloggerSql('nopd.vendor_id')}
               AND nopd.new_site_id IS NOT NULL
             ORDER BY nop.id DESC, nop.updated_at DESC
             LIMIT 2000`,
@@ -710,7 +721,7 @@ const getCompletedOrderDetail = async (req, res, next) => {
                 ns.traffic
             FROM new_order_process_details nopd
             LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
-            WHERE nopd.new_order_process_id = $1
+            WHERE nopd.new_order_process_id = $1 AND ${activeBloggerSql('nopd.vendor_id')}
             ORDER BY nopd.created_at ASC`,
             [processId]
         );

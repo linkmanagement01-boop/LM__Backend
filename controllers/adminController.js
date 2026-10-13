@@ -11,6 +11,7 @@ const logger = require('../utils/logger');
 const PDFDocument = require('pdfkit');
 const jwt = require('jsonwebtoken');
 const { sendPaymentApprovedEmail } = require('../utils/emailService');
+const { activeSiteSql, activeBloggerSql, getDeactivationBlockers } = require('../utils/bloggerStatus');
 
 // Configure multer for file uploads
 const upload = multer({ dest: 'uploads/' });
@@ -99,6 +100,21 @@ const updateUser = async (req, res, next) => {
     try {
         const { id } = req.params;
         const updates = req.body;
+
+        // Deactivating a blogger: only allowed when no order is in progress and the wallet is empty
+        if (updates.is_active === false || updates.is_active === 0 || updates.status === 0) {
+            const target = await User.findById(id);
+            if (target && ['vendor', 'blogger'].includes(String(target.role || '').toLowerCase())) {
+                const blockers = await getDeactivationBlockers(id);
+                if (blockers.length > 0) {
+                    return res.status(400).json({
+                        error: 'Cannot Deactivate',
+                        message: `${target.name || 'This blogger'} cannot be made inactive yet. ${blockers.join(' ')}`,
+                        blockers
+                    });
+                }
+            }
+        }
 
         const user = await User.update(id, updates);
 
@@ -674,9 +690,9 @@ const getBloggersWallets = async (req, res, next) => {
         let countSql = `
             SELECT COUNT(*) as total
             FROM users u
-            WHERE u.role = 'Blogger' OR EXISTS (
+            WHERE ${activeBloggerSql('u.id')} AND (u.role = 'Blogger' OR EXISTS (
                 SELECT 1 FROM wallets w WHERE w.user_id = u.id
-            )
+            ))
         `;
 
         let sql = `
@@ -724,9 +740,9 @@ const getBloggersWallets = async (req, res, next) => {
                     0
                 ) as wallet_balance
             FROM users u
-            WHERE u.role = 'Blogger' OR EXISTS (
+            WHERE ${activeBloggerSql('u.id')} AND (u.role = 'Blogger' OR EXISTS (
                 SELECT 1 FROM wallets w WHERE w.user_id = u.id
-            )
+            ))
         `;
 
         const params = [];
@@ -860,7 +876,7 @@ const getPaymentHistory = async (req, res, next) => {
             LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
             LEFT JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
             LEFT JOIN new_orders no ON nop.new_order_id = no.id
-            WHERE wr.status = 1
+            WHERE wr.status = 1 AND ${activeBloggerSql('wr.user_id')}
         `;
 
         const params = [];
@@ -1019,7 +1035,7 @@ const getWithdrawalRequests = async (req, res, next) => {
             LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
             LEFT JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
             LEFT JOIN new_orders no ON nop.new_order_id = no.id
-            WHERE wr.status = 0
+            WHERE wr.status = 0 AND ${activeBloggerSql('wr.user_id')}
         `;
 
         const params = [];
@@ -2065,7 +2081,7 @@ const getWebsitesList = async (req, res, next) => {
         const offset = (page - 1) * limit;
 
         // Build dynamic WHERE conditions as an array
-        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`];
+        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`, activeSiteSql('ns')];
         const queryParams = [];
         let paramIndex = 1;
 
@@ -2194,7 +2210,7 @@ const getDeletedWebsitesList = async (req, res, next) => {
         const offset = (page - 1) * limit;
 
         // Build dynamic WHERE conditions as an array
-        const conditions = [`ns.delete_site = 1`];
+        const conditions = [`ns.delete_site = 1`, activeSiteSql('ns')];
         const queryParams = [];
         let paramIndex = 1;
 

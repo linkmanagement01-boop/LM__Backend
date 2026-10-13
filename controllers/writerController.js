@@ -1,4 +1,5 @@
 const Task = require('../models/Task');
+const { activeBloggerSql } = require('../utils/bloggerStatus');
 
 /**
  * Writer Controller
@@ -398,7 +399,7 @@ const getCompletedOrders = async (req, res, next) => {
              JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
              JOIN new_orders no ON nop.new_order_id = no.id
              LEFT JOIN users m ON no.manager_id = m.id
-             WHERE nop.writer_id = $1 
+             WHERE nop.writer_id = $1 AND ${activeBloggerSql('nopd.vendor_id')}
                AND nop.status >= 3
                AND ((nopd.doc_urls IS NOT NULL AND nopd.doc_urls != '') 
                  OR (nopd.insert_after IS NOT NULL AND nopd.insert_after != '') 
@@ -496,7 +497,7 @@ const getCompletedOrderDetail = async (req, res, next) => {
                 ns.root_domain as website_domain
              FROM new_order_process_details nopd
              LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
-             WHERE nopd.new_order_process_id = $1
+             WHERE nopd.new_order_process_id = $1 AND ${activeBloggerSql('nopd.vendor_id')}
              ORDER BY nopd.id ASC`,
             [processId]
         );

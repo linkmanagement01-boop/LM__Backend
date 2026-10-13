@@ -1,4 +1,5 @@
 const { query } = require('../config/database');
+const { activeBloggerSql } = require('../utils/bloggerStatus');
 const logger = require('../utils/logger');
 
 /**
@@ -128,6 +129,7 @@ const getFinancialReport = async (req, res, next) => {
             JOIN new_order_processes nop ON nop.new_order_id = no.id
             JOIN new_order_process_details nopd ON nopd.new_order_process_id = nop.id
             JOIN users b ON nopd.vendor_id = b.id
+            WHERE ${activeBloggerSql('b.id')}
             ORDER BY b.name
         `);
 

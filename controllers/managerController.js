@@ -3,6 +3,7 @@ const Transaction = require('../models/Transaction');
 const { isTransitionAllowed } = require('../utils/statusTransitions');
 const { addCreditToBloggerWallet, processWithdrawalApproval } = require('../utils/walletService');
 const { query } = require('../config/database');
+const { activeSiteSql, activeBloggerSql, findInactiveBloggerSites, inactiveSitesMessage } = require('../utils/bloggerStatus');
 const { sendOrderAssignedEmail } = require('../utils/emailService');
 
 /**
@@ -35,7 +36,7 @@ const getDashboardStats = async (req, res, next) => {
              FROM new_order_process_details nopd
              JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
              JOIN new_orders o ON nop.new_order_id = o.id
-             WHERE nopd.status = 7 
+             WHERE nopd.status = 7 AND ${activeBloggerSql('nopd.vendor_id')}
                AND nopd.submit_url IS NOT NULL
                AND o.new_order_status < 5
                AND o.order_id NOT LIKE 'CLT-%'`
@@ -83,7 +84,7 @@ const getDashboardStats = async (req, res, next) => {
             `SELECT COUNT(*) as count FROM new_order_process_details nopd
              JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
              JOIN new_orders o ON nop.new_order_id = o.id
-             WHERE (nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != ''))
+             WHERE (nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != '')) AND ${activeBloggerSql('nopd.vendor_id')}
                AND o.order_id NOT LIKE 'CLT-%'`
         );
 
@@ -108,7 +109,7 @@ const getDashboardStats = async (req, res, next) => {
              JOIN new_orders o ON nop.new_order_id = o.id
              LEFT JOIN users u ON nopd.vendor_id = u.id
              LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
-             WHERE nopd.status = 7
+             WHERE nopd.status = 7 AND ${activeBloggerSql('nopd.vendor_id')}
                AND nopd.submit_url IS NOT NULL
                AND o.new_order_status < 5
                AND o.order_id NOT LIKE 'CLT-%'
@@ -543,7 +544,7 @@ const getPendingFromBloggers = async (req, res, next) => {
              JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
              JOIN new_orders no ON nop.new_order_id = no.id
              LEFT JOIN users v ON nopd.vendor_id = v.id
-             WHERE nopd.status = 7 
+             WHERE nopd.status = 7 AND ${activeBloggerSql('nopd.vendor_id')}
                AND nopd.submit_url IS NOT NULL
                AND no.new_order_status < 5
                AND no.order_id NOT LIKE 'CLT-%'
@@ -628,7 +629,7 @@ const getRejectedOrders = async (req, res, next) => {
             `SELECT COUNT(*) as total FROM new_order_process_details nopd
              JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
              JOIN new_orders o ON nop.new_order_id = o.id
-             WHERE (nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != ''))
+             WHERE (nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != '')) AND ${activeBloggerSql('nopd.vendor_id')}
                AND o.order_id NOT LIKE 'CLT-%'`
         );
         const total = parseInt(countResult.rows[0]?.total || 0);
@@ -653,7 +654,7 @@ const getRejectedOrders = async (req, res, next) => {
              JOIN new_orders o ON nop.new_order_id = o.id
              LEFT JOIN users u ON nopd.vendor_id = u.id
              LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
-             WHERE (nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != ''))
+             WHERE (nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != '')) AND ${activeBloggerSql('nopd.vendor_id')}
                AND o.order_id NOT LIKE 'CLT-%'
              ORDER BY nopd.updated_at DESC
              LIMIT $1 OFFSET $2`,
@@ -948,7 +949,7 @@ const getOrderDetails = async (req, res, next) => {
                  FROM new_order_process_details nopd
                  LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
                  LEFT JOIN users b ON nopd.vendor_id = b.id
-                 WHERE nopd.new_order_process_id = $1
+                 WHERE nopd.new_order_process_id = $1 AND ${activeBloggerSql('nopd.vendor_id')}
                  ORDER BY nopd.created_at ASC`,
                 [process.id]
             );
@@ -1861,7 +1862,7 @@ const getWriters = async (req, res, next) => {
 const getBloggers = async (req, res, next) => {
     try {
         const result = await query(
-            "SELECT id, username, email FROM users WHERE role = 'Blogger' AND is_active = true ORDER BY username"
+            "SELECT id, name, name as username, email FROM users WHERE LOWER(role) IN ('vendor', 'blogger') AND status = 1 ORDER BY name"
         );
 
         res.json({
@@ -1885,7 +1886,7 @@ const getWebsites = async (req, res, next) => {
         const offset = (page - 1) * limit;
 
         // Build dynamic WHERE conditions as an array
-        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`, `ns.site_status = '1'`];
+        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`, `ns.site_status = '1'`, activeSiteSql('ns')];
         const queryParams = [];
         let paramIndex = 1;
 
@@ -2057,6 +2058,11 @@ nopd.id as detail_id,
                 error: 'No websites found',
                 message: 'No websites are selected for this order'
             });
+        }
+
+        const inactiveSites = await findInactiveBloggerSites(details.rows.map(d => d.new_site_id));
+        if (inactiveSites.length > 0) {
+            return res.status(400).json({ error: 'Validation Error', message: inactiveSitesMessage(inactiveSites) });
         }
 
         // Resolve correct owner — fallback via case-insensitive email if site is wrongly under admin
@@ -2585,6 +2591,11 @@ const createOrderChain = async (req, res, next) => {
         }
         if (target_stage === 'writer' && !assigned_writer_id) {
             return res.status(400).json({ error: 'Validation Error', message: 'Writer ID is required' });
+        }
+
+        const inactiveSites = await findInactiveBloggerSites(websites.map(w => w.id));
+        if (inactiveSites.length > 0) {
+            return res.status(400).json({ error: 'Validation Error', message: inactiveSitesMessage(inactiveSites) });
         }
 
         if (target_stage === 'blogger') {
@@ -3304,6 +3315,11 @@ const pushClientOrderToBlogger = async (req, res, next) => {
             return res.status(400).json({ error: 'No sites found in this order' });
         }
 
+        const inactiveSites = await findInactiveBloggerSites(detailsResult.rows.map(d => d.site_id));
+        if (inactiveSites.length > 0) {
+            return res.status(400).json({ error: inactiveSitesMessage(inactiveSites) });
+        }
+
         // Resolve correct vendor_id — fallback via case-insensitive email if site is wrongly under admin
         for (const d of detailsResult.rows) {
             if ((!d.vendor_id || d.vendor_id === 1) && d.site_email) {
@@ -3458,6 +3474,11 @@ const sendClientOrderToWriter = async (req, res, next) => {
 
         if (detailsResult.rows.length === 0) {
             return res.status(400).json({ error: 'No sites found in this order' });
+        }
+
+        const inactiveSites = await findInactiveBloggerSites(detailsResult.rows.map(d => d.site_id));
+        if (inactiveSites.length > 0) {
+            return res.status(400).json({ error: inactiveSitesMessage(inactiveSites) });
         }
 
         // Resolve correct vendor_id — fallback via case-insensitive email if site is wrongly under admin

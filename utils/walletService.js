@@ -122,7 +122,7 @@ const deductFromWallet = async (bloggerId, amount) => {
  * Uses site prices since nopd.price may be 0
  * Excludes orders that are part of an approved withdrawal request
  */
-const getUnapprovedCreditsBalance = async (bloggerId) => {
+const getUnapprovedCreditsBalance = async (bloggerId, { throwOnError = false } = {}) => {
     try {
         // Calculate balance from completed orders (status=8) that haven't been withdrawn
         // Exclude orders where:
@@ -174,6 +174,7 @@ const getUnapprovedCreditsBalance = async (bloggerId) => {
         return parseFloat(result.rows[0]?.total || 0);
     } catch (error) {
         console.error('❌ Error getting unapproved credits balance:', error);
+        if (throwOnError) throw error;
         return 0;
     }
 };
