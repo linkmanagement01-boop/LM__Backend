@@ -42,6 +42,15 @@ const login = async (req, res, next) => {
             });
         }
 
+        // Client accounts can't use the dashboard for now (turn back on with CLIENT_LOGIN_ENABLED=true)
+        if (String(user.role || '').toLowerCase() === 'client' && process.env.CLIENT_LOGIN_ENABLED !== 'true') {
+            logger.warn('Auth', `Login blocked - client login disabled for: ${email}`);
+            return res.status(403).json({
+                error: 'Login Disabled',
+                message: 'Client login is not available at the moment. Please contact your account manager.'
+            });
+        }
+
         // Check if user is active
         if (!user.is_active) {
             logger.warn('Auth', `Login failed - account disabled for: ${email}`);

@@ -319,6 +319,7 @@ class Task {
             website_niche_price: detail.website_niche_price,
             content_body: process.doc_urls || process.note,
             content_instructions: process.statement,
+            team_note: process.note || '', // general note the team wrote when pushing to the manager
             live_published_url: detail.submit_url,
             rejection_reason: detail.reject_reason,
             current_status: this.mapStatus(process.status || order.new_order_status, process.writer_id, detail.vendor_id, detail.submit_url),

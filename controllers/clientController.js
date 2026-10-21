@@ -491,12 +491,18 @@ const createOrder = async (req, res, next) => {
             });
         }
 
-        // 3. Deduct from wallet atomically
-        const newBalance = currentBalance - totalPrice;
-        await query(
-            'UPDATE wallets SET balance = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-            [newBalance, walletId]
+        // 3. Deduct from wallet atomically: the database subtracts only if the balance is still enough,
+        // so two orders placed at the same moment can't spend the same money
+        const deducted = await query(
+            'UPDATE wallets SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND balance >= $1 RETURNING balance',
+            [totalPrice, walletId]
         );
+        if (deducted.rows.length === 0) {
+            return res.status(400).json({
+                error: 'Insufficient Balance',
+                message: `Your wallet balance is lower than the order total ($${totalPrice.toFixed(2)}). Please top up your wallet first.`
+            });
+        }
 
         // 4.5 Round Robin Manager Assignment
         let assignedManagerId = null;

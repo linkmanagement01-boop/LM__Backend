@@ -2,6 +2,7 @@ const Task = require('../models/Task');
 const Website = require('../models/Website');
 const { query } = require('../config/database');
 const { activeSiteSql, activeBloggerSql, findInactiveBloggerSites, inactiveSitesMessage } = require('../utils/bloggerStatus');
+const { scorePosts, verifyPostLinks, hostOf } = require('../utils/postScore');
 
 /**
  * Team Controller - Production Database Compatible
@@ -438,6 +439,246 @@ const getOrderNotifications = async (req, res, next) => {
  * @desc    Get specific order details for Push to Manager page
  * @access  Team only
  */
+/**
+ * @route   GET /api/team/order-notifications/:id/keyword-search?keyword=&budget=&page=&limit=
+ * @desc    Search saved blog posts (from site sitemaps) of sites within budget.
+ *          Price used depends on the order: FC → FC GP / FC Edit price, otherwise GP / Edit price.
+ *          Sites whose price is N/A, empty or 0 are skipped.
+ * @access  Team
+ */
+// Post URL compared without protocol, "www.", query string or trailing slash
+const normalizePostUrl = (u) => String(u || '').trim().toLowerCase()
+    .replace(/^https?:\/\/(www\.)?/, '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+const normalizedUrlSql = (col) =>
+    `RTRIM(REGEXP_REPLACE(REGEXP_REPLACE(LOWER(${col}), '^https?://(www\\.)?', ''), '[?#].*$', ''), '/')`;
+
+/**
+ * Post URLs we already used in our own orders for this client domain (except the current order,
+ * and tasks the blogger declined – status 12 – since that link was never placed).
+ */
+const postsUsedForClient = async (clientDomain, currentOrderId) => {
+    if (!clientDomain) return [];
+    const rows = (await query(
+        `SELECT DISTINCT u FROM (
+            SELECT unnest(ARRAY[nopd.ourl, nopd.doc_urls, nopd.submit_url]) AS u
+            FROM new_order_process_details nopd
+            JOIN new_order_processes nop ON nop.id = nopd.new_order_process_id
+            JOIN new_orders o ON o.id = nop.new_order_id
+            WHERE o.id <> $2 AND COALESCE(nopd.status, 0) <> 12
+              AND LOWER(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(COALESCE(o.client_website, '')), '^(https?://)?(www\\.)?', '', 'i'), '[/?#].*$', '')) = $1
+         ) x
+         WHERE u ~* '^https?://'`,
+        [clientDomain, currentOrderId]
+    )).rows;
+    return [...new Set(rows.map(r => normalizePostUrl(r.u)).filter(Boolean))];
+};
+
+// Keyword → up to 6 distinct lowercase words of 2+ letters
+const keywordWords = (keyword) => [...new Set(String(keyword || '').toLowerCase()
+    .split(/[^a-z0-9]+/).filter(w => w.length >= 2))].slice(0, 6);
+
+/**
+ * @route   POST /api/team/order-notifications/:id/keyword-scores   { keyword, urls: [...] }
+ * @desc    Keyword score per post (permalink / H1 / content), see utils/postScore.js.
+ *          Only URLs from our saved post list are opened.
+ * @access  Team
+ */
+const keywordScores = async (req, res, next) => {
+    try {
+        const words = keywordWords(req.body.keyword);
+        const urls = Array.isArray(req.body.urls) ? [...new Set(req.body.urls.map(String))].slice(0, 10) : [];
+        if (words.length === 0 || urls.length === 0) {
+            return res.status(400).json({ error: 'Validation Error', message: 'Keyword and post URLs are required' });
+        }
+        const known = new Set((await query(`SELECT url FROM site_posts WHERE url = ANY($1::text[])`, [urls])).rows.map(r => r.url));
+        const allowed = urls.filter(u => known.has(u));
+        // Posts whose article already links to the order's client website are flagged (links_to_client)
+        const task = await Task.findById(req.params.id);
+        const clientDomain = hostOf(task?.client_website);
+        const scores = await scorePosts(words, allowed, { clientDomain });
+        res.json({ words, client_domain: clientDomain || null, scores });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   POST /api/team/order-notifications/:id/verify-post   { url }
+ * @desc    Re-read one post live right before the team picks it: does the article now link to the
+ *          client website, or was it already used in one of our orders for this client?
+ * @access  Team
+ */
+const verifyPost = async (req, res, next) => {
+    try {
+        const url = String(req.body.url || '');
+        const known = (await query(`SELECT 1 FROM site_posts WHERE url = $1 LIMIT 1`, [url])).rows.length > 0;
+        if (!known) return res.status(400).json({ error: 'Validation Error', message: 'Unknown post' });
+
+        const task = await Task.findById(req.params.id);
+        const clientDomain = hostOf(task?.client_website);
+        if (!clientDomain) return res.json({ url, client_domain: null, links_to_client: null, used_before: false });
+
+        const usedBefore = (await postsUsedForClient(clientDomain, req.params.id)).includes(normalizePostUrl(url));
+        const check = await verifyPostLinks(url, clientDomain);
+        res.json({ ...check, client_domain: clientDomain, used_before: usedBefore });
+    } catch (error) {
+        next(error);
+    }
+};
+
+const keywordSearch = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+        const budget = parseFloat(req.query.budget);
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20)); // websites per page
+        const offset = (page - 1) * limit;
+
+        if (!(budget > 0)) {
+            return res.status(400).json({ error: 'Validation Error', message: 'Please enter a budget greater than 0' });
+        }
+        const words = keywordWords(req.query.keyword);
+        if (words.length === 0) {
+            return res.status(400).json({ error: 'Validation Error', message: 'Please enter a keyword' });
+        }
+
+        const task = await Task.findById(id);
+        if (!task || !task.assigned_team_id) {
+            return res.status(404).json({ error: 'Not Found', message: 'Task not found or not assigned to any team member' });
+        }
+
+        const isNiche = /niche|edit|insertion/i.test(task.order_type || '');
+        const isFC = Number(task.fc) === 1;
+        const priceColumn = isFC ? (isNiche ? 'ns.fc_ne' : 'ns.fc_gp') : (isNiche ? 'ns.niche_edit_price' : 'ns.gp_price');
+        const priceLabel = isFC ? (isNiche ? 'FC Edit price' : 'FC GP price') : (isNiche ? 'Edit price' : 'GP price');
+        const cleaned = `REGEXP_REPLACE(COALESCE(${priceColumn}::text, ''), '[^0-9.]', '', 'g')`;
+        const priceExpr = `(CASE WHEN ${cleaned} ~ '^[0-9]+(\\.[0-9]+)?$' THEN ${cleaned}::numeric END)`;
+
+        // Sites the team can pick, priced (not N/A / 0) and within budget
+        const siteWhere = `(ns.delete_site IS NULL OR ns.delete_site = 0) AND ns.site_status = '1' AND ${activeSiteSql('ns')}
+                           AND ${priceExpr} > 0 AND ${priceExpr} <= $1`;
+
+        // Each word must START a word in the post's title/URL words ("weed" matches "weeds", not "seaweed").
+        // The plain LIKE '%word%' lets the trigram index narrow the rows first; the word-start check is exact.
+        const params = [budget, ...words.map(w => `%${w}%`), ...words.map(w => `% ${w}%`)];
+        const containsConds = words.map((_, i) => `sp.search_text LIKE $${i + 2}`);
+        const wordConds = words.map((_, i) => `(' ' || sp.search_text) LIKE $${i + 2 + words.length}`);
+        const score = wordConds.map(c => `(CASE WHEN ${c} THEN 1 ELSE 0 END)`).join(' + ');
+
+        const sitesInfo = (await query(
+            `SELECT COUNT(*) AS in_budget,
+                    COUNT(sps.site_id) FILTER (WHERE sps.status = 'ok') AS indexed
+             FROM new_sites ns
+             LEFT JOIN site_post_sources sps ON sps.site_id = ns.id
+             WHERE ${siteWhere}`,
+            [budget]
+        ).catch(err => {
+            if (err.code === '42P01') return { rows: [{ in_budget: 0, indexed: 0 }] }; // index not built yet
+            throw err;
+        })).rows[0];
+
+        // Posts already used in OUR earlier orders for the same client are left out (works instantly,
+        // even before the link is live, and on sites that block reading)
+        const clientDomain = hostOf(task.client_website);
+        const usedUrls = await postsUsedForClient(clientDomain, id);
+        params.push(usedUrls);
+        const notUsedCond = `${normalizedUrlSql('sp.url')} <> ALL($${params.length}::text[])`;
+        const keywordWhere = `${siteWhere} AND (${containsConds.join(' OR ')}) AND (${wordConds.join(' OR ')})`;
+
+        const base = `FROM site_posts sp
+                      JOIN new_sites ns ON ns.id = sp.site_id
+                      WHERE ${keywordWhere} AND ${notUsedCond}`;
+
+        // How many matching posts were left out because we already used them for this client
+        let usedHidden = 0;
+        if (usedUrls.length) {
+            usedHidden = parseInt((await query(
+                `SELECT COUNT(*) AS c FROM site_posts sp JOIN new_sites ns ON ns.id = sp.site_id
+                 WHERE ${keywordWhere} AND ${normalizedUrlSql('sp.url')} = ANY($${params.length}::text[])`,
+                params
+            ).catch(() => ({ rows: [{ c: 0 }] }))).rows[0].c) || 0;
+        }
+
+        // One row per WEBSITE: each site's top candidate posts (by how well the link matches),
+        // the page then scores the candidates (permalink/H1/content) and shows the best one.
+        const CANDIDATES_PER_SITE = 5;
+        const ranked = `
+            WITH matches AS (
+                SELECT sp.id AS post_id, sp.site_id, sp.url AS post_url, sp.title AS post_title, sp.lastmod AS post_date,
+                       ${score} AS match_count
+                ${base}
+            ), ranked AS (
+                SELECT m.*,
+                       ROW_NUMBER() OVER (PARTITION BY m.site_id ORDER BY m.match_count DESC, m.post_date DESC NULLS LAST, m.post_id DESC) AS rn,
+                       COUNT(*) OVER (PARTITION BY m.site_id) AS matching_posts
+                FROM matches m
+            )`;
+
+        let total = 0;
+        let sites = [];
+        try {
+            total = parseInt((await query(`${ranked} SELECT COUNT(*) AS total FROM ranked WHERE rn = 1`, params)).rows[0].total);
+            const rows = (await query(
+                `${ranked},
+                 site_page AS (
+                    SELECT r.site_id, r.match_count AS best_match, r.matching_posts,
+                           ${priceExpr} AS budget_price,
+                           ns.id, ns.root_domain, ns.niche, ns.category,
+                           ns.da, ns.dr, ns.rd, ns.spam_score, ns.traffic_source AS traffic, ns.traffic_source,
+                           ns.gp_price, ns.niche_edit_price, ns.niche_edit_price AS niche_price,
+                           ns.fc_gp, ns.fc_ne, ns.site_status, ns.website_status, ns.website_niche
+                    FROM ranked r JOIN new_sites ns ON ns.id = r.site_id
+                    WHERE r.rn = 1
+                    ORDER BY best_match DESC, budget_price ASC,
+                             (CASE WHEN ns.traffic_source::text ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.traffic_source::numeric ELSE 0 END) DESC,
+                             ns.id
+                    LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+                 )
+                 SELECT sp_.*, r.post_id, r.post_url, r.post_title, r.post_date, r.match_count, r.rn,
+                        ROW_NUMBER() OVER () AS site_order
+                 FROM site_page sp_
+                 JOIN ranked r ON r.site_id = sp_.site_id AND r.rn <= ${CANDIDATES_PER_SITE}
+                 ORDER BY sp_.best_match DESC, sp_.budget_price ASC,
+                          (CASE WHEN sp_.traffic_source::text ~ '^[0-9]+(\\.[0-9]+)?$' THEN sp_.traffic_source::numeric ELSE 0 END) DESC,
+                          sp_.id, r.rn`,
+                [...params, limit, offset]
+            )).rows;
+
+            // Group candidate posts under their site (rows arrive in site order, candidates in rank order)
+            const bySite = new Map();
+            for (const row of rows) {
+                if (!bySite.has(row.site_id)) {
+                    const { post_id, post_url, post_title, post_date, match_count, rn, site_order, ...site } = row;
+                    bySite.set(row.site_id, { ...site, matching_posts: parseInt(row.matching_posts), candidates: [] });
+                }
+                bySite.get(row.site_id).candidates.push({
+                    post_id: row.post_id, post_url: row.post_url, post_title: row.post_title,
+                    post_date: row.post_date, match_count: row.match_count
+                });
+            }
+            sites = [...bySite.values()];
+        } catch (err) {
+            if (err.code !== '42P01') throw err; // 42P01 = post index table not created yet → no results
+        }
+
+        res.json({
+            sites,
+            words,
+            price_used: priceLabel,
+            client_domain: clientDomain || null,
+            used_before_hidden: usedHidden,
+            order_type: isNiche ? 'Niche Edit' : 'Guest Post',
+            fc: isFC,
+            budget,
+            sites_in_budget: parseInt(sitesInfo.in_budget) || 0,
+            sites_indexed: parseInt(sitesInfo.indexed) || 0,
+            pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
 const getTaskForPush = async (req, res, next) => {
     try {
         const { id } = req.params;
@@ -478,6 +719,23 @@ const submitWebsitesToManager = async (req, res, next) => {
         const inactiveSites = await findInactiveBloggerSites(website_ids);
         if (inactiveSites.length > 0) {
             return res.status(400).json({ error: 'Validation Error', message: inactiveSitesMessage(inactiveSites) });
+        }
+
+        // Every site needs an anchor text and a valid target URL (the note is optional)
+        for (const websiteId of website_ids) {
+            const d = Array.isArray(website_data) ? website_data.find(w => w.id == websiteId || w.website_id == websiteId) : null;
+            const anchor = String(d?.anchor || '').trim();
+            const target = String(d?.target_url || '').trim();
+            let validUrl = /^https?:\/\//i.test(target) && target.length <= 255;
+            try { if (validUrl) new URL(target); } catch { validUrl = false; }
+            if (!anchor || !validUrl) {
+                return res.status(400).json({
+                    error: 'Validation Error',
+                    message: !anchor
+                        ? 'Anchor text is required for every selected website'
+                        : 'A valid target URL (starting with http:// or https://, max 255 characters) is required for every selected website'
+                });
+            }
         }
 
         // Get current task
@@ -539,20 +797,23 @@ const submitWebsitesToManager = async (req, res, next) => {
             console.log(`  note: "${siteData?.note || ''}"`);
             console.log(`  copyUrl: "${siteData?.copyUrl || ''}"`);
 
+            // anchor → nopd.anchor, target URL → nopd.url (the manager's review page pre-fills from these)
             const insertResult = await query(
-                `INSERT INTO new_order_process_details 
-                 (new_order_process_id, new_site_id, note, doc_urls, ourl, price, created_at, updated_at, status)
-                 VALUES ($1, $2, $3, $4, $5, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 2)
+                `INSERT INTO new_order_process_details
+                 (new_order_process_id, new_site_id, note, doc_urls, ourl, anchor, url, price, created_at, updated_at, status)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 2)
                  RETURNING id`,
-                [processId, websiteId, siteData?.note || null, siteData?.copyUrl || null, siteData?.copyUrl || null]
+                [processId, websiteId, siteData?.note || null, siteData?.copyUrl || null, siteData?.copyUrl || null,
+                    String(siteData?.anchor || '').trim(), String(siteData?.target_url || '').trim()]
             );
             console.log(`Inserted detail ID: ${insertResult.rows[0]?.id}`);
         }
 
         // Update task status to PENDING_MANAGER_APPROVAL_1
-        const updatedTask = await Task.updateStatus(id, 'PENDING_MANAGER_APPROVAL_1', {
-            notes: notes || null
-        });
+        // The team's general note is always stored (even empty), so an older note – e.g. the
+        // manager's note from order creation – is never shown to the manager as the team's
+        await query(`UPDATE new_order_processes SET note = $1 WHERE id = $2`, [notes || '', processId]);
+        const updatedTask = await Task.updateStatus(id, 'PENDING_MANAGER_APPROVAL_1');
 
         res.json({
             message: 'Websites submitted to Manager for approval',
@@ -1140,6 +1401,9 @@ module.exports = {
     addWebsite,
     getOrderNotifications,
     getTaskForPush,
+    keywordSearch,
+    keywordScores,
+    verifyPost,
     submitWebsitesToManager,
     getCompletedOrders,
     getCompletedOrderDetail,
