@@ -24,6 +24,7 @@ const configRoutes = require('./routes/config');
 const threadRoutes = require('./routes/threads');
 const chatRoutes = require('./routes/chat');
 const clientRoutes = require('./routes/client');
+const marketplaceRoutes = require('./routes/marketplace');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -35,6 +36,7 @@ const server = http.createServer(app);
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:5174',
+  'http://localhost:5175', // marketplace frontend (local dev)
   'http://localhost:3000',
   'https://linkmanagement.femur.studio',
   'https://api-linkmanagement.femur.studio',
@@ -227,6 +229,10 @@ app.use('/api/config', configRoutes);
 app.use('/api/threads', threadRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/client', clientRoutes);
+// Marketplace storefront API (white-label, later India / International) – only when switched on
+if (process.env.MARKETPLACE_ENABLED === 'true') {
+  app.use('/api/marketplace', marketplaceRoutes);
+}
 
 // 404 handler
 app.use((req, res) => {
@@ -245,6 +251,14 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🔌 Socket.io enabled for real-time updates`);
   console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+
+  // Marketplace tables/columns are created even while the storefront is off – dashboard pages read some of them
+  require('./utils/marketplace').ensureSchema()
+    .then(() => console.log(`🛒 Marketplace storefront API: ${process.env.MARKETPLACE_ENABLED === 'true' ? 'ON' : 'OFF'}`))
+    .catch(err => console.error('Marketplace schema setup failed:', err.message));
+
+  // Daily job: save each active site's blog posts (from its sitemap) for the team's keyword search
+  require('./jobs/postIndexer').startPostIndexer();
 });
 
 module.exports = app;

@@ -22,7 +22,11 @@ const transporter = nodemailer.createTransport({
 const FROM = `"LinkManagement" <${process.env.FROM_EMAIL || 'contact@linkmanagement.net'}>`;
 
 // ─── Base HTML wrapper ───────────────────────────────────────────────
-const wrapHTML = (bodyContent) => `
+// Brand shown in the email header/footer and sender name. Default = LinkManagement (internal emails);
+// marketplace emails pass their own brand so white-label clients never see LinkManagement.
+const DEFAULT_BRAND = { name: 'LinkManagement', site: 'LinkManagement.net', url: 'https://www.linkmanagement.net', tagline: 'Professional Link Building Platform' };
+
+const wrapHTML = (bodyContent, brand = DEFAULT_BRAND) => `
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -60,15 +64,15 @@ const wrapHTML = (bodyContent) => `
 <body>
 <div class="container">
   <div class="header">
-    <h1>LinkManagement.net</h1>
-    <div class="tagline">Professional Link Building Platform</div>
+    <h1>${brand.site || brand.name}</h1>
+    <div class="tagline">${brand.tagline || ''}</div>
   </div>
   <div class="body">
     ${bodyContent}
   </div>
   <div class="footer">
-    <p>This is an automated notification from <a href="https://www.linkmanagement.net">LinkManagement.net</a></p>
-    <p>&copy; ${new Date().getFullYear()} LinkManagement. All rights reserved.</p>
+    <p>This is an automated notification from <a href="${brand.url}">${brand.site || brand.name}</a></p>
+    <p>&copy; ${new Date().getFullYear()} ${brand.name}. All rights reserved.</p>
   </div>
 </div>
 </body>
@@ -80,18 +84,18 @@ const normalizeRecipient = (raw) => String(raw || '')
     .split(/[\s,;]+/)
     .find(part => EMAIL_RE.test(part)) || null;
 
-const sendEmail = async (rawTo, subject, htmlBody) => {
+const sendEmail = async (rawTo, subject, htmlBody, { brand = DEFAULT_BRAND } = {}) => {
     const to = normalizeRecipient(rawTo);
     if (!to) {
         console.error(`❌ Email SKIPPED – invalid recipient "${rawTo}" – ${subject}`);
         return false;
     }
     try {
-        const html = wrapHTML(htmlBody);
+        const html = wrapHTML(htmlBody, brand);
 
         // Railway Hobby blocks SMTP, so use EmailIt's HTTPS API when a key is set
         if (process.env.EMAILIT_API_KEY) {
-            const fromApi = `LinkManagement <${process.env.FROM_EMAIL || 'contact@linkmanagement.net'}>`;
+            const fromApi = `${brand.name} <${brand.fromEmail || process.env.FROM_EMAIL || 'contact@linkmanagement.net'}>`;
             const res = await axios.post(
                 'https://api.emailit.com/v2/emails',
                 { from: fromApi, to, subject, html },
@@ -109,7 +113,7 @@ const sendEmail = async (rawTo, subject, htmlBody) => {
 
         // Fallback: SMTP (works locally, but is blocked on Railway Hobby)
         const info = await transporter.sendMail({
-            from: FROM,
+            from: brand === DEFAULT_BRAND ? FROM : `"${brand.name}" <${brand.fromEmail || process.env.FROM_EMAIL || 'contact@linkmanagement.net'}>`,
             to,
             subject,
             html

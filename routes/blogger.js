@@ -41,6 +41,9 @@ router.use(authenticate, authorize('Blogger'));
 // ==================== STATISTICS ====================
 router.get('/stats', bloggerController.getStatistics);
 
+// ==================== GUIDES (admin's More Links → Videos) ====================
+router.get('/guides', bloggerController.getGuides);
+
 // ==================== TASK MANAGEMENT ====================
 router.get('/tasks', bloggerController.getMyTasks);
 router.get('/tasks/:id', bloggerController.getTaskById);

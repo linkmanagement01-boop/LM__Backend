@@ -2,7 +2,9 @@ const Task = require('../models/Task');
 const Transaction = require('../models/Transaction');
 const { isTransitionAllowed } = require('../utils/statusTransitions');
 const { addCreditToBloggerWallet, processWithdrawalApproval } = require('../utils/walletService');
-const { query } = require('../config/database');
+const { query, transaction } = require('../config/database');
+const logger = require('../utils/logger');
+const { notifyLinkLive, notifyRefund } = require('../utils/marketplaceNotify');
 const { activeSiteSql, activeBloggerSql, findInactiveBloggerSites, inactiveSitesMessage } = require('../utils/bloggerStatus');
 const { sendOrderAssignedEmail } = require('../utils/emailService');
 
@@ -2445,6 +2447,9 @@ const finalizeFromBlogger = async (req, res, next) => {
             }
         }
 
+        // Marketplace client: "your link is live" email + notification (no-op for everyone else)
+        notifyLinkLive(id);
+
         res.json({
             message: allLinksComplete
                 ? 'Order finalized! All links are complete.'
@@ -3081,6 +3086,7 @@ const getClientOrderDetails = async (req, res, next) => {
 
         const detailsResult = await query(
             `SELECT cod.id, cod.client_order_id, cod.site_id, cod.fill_details,
+                    to_jsonb(cod)->>'content_by' AS content_by, to_jsonb(cod)->'brief' AS brief, -- marketplace columns; null if not created yet
                     COALESCE(nopd.url, cod.target_url) as target_url,
                     COALESCE(nopd.anchor, cod.anchor_text) as anchor_text,
                     COALESCE(nopd.title, cod.article_title) as article_title,
@@ -3230,39 +3236,38 @@ const rejectClientOrder = async (req, res, next) => {
             });
         }
 
-        // 3. Update order status and notes
-        await query(
-            `UPDATE client_orders 
-             SET status = 'rejected', manager_notes = $1, updated_at = CURRENT_TIMESTAMP 
-             WHERE id = $2`,
-            [manager_notes || 'Order rejected by manager', orderId]
-        );
-
-        // 4. Issue Refund if there was a charge
+        // 3 + 4. Reject and refund in ONE transaction: only the request that actually changes the status
+        // refunds, so a double click (or two managers at once) can never refund twice
         const refundAmount = parseFloat(order.total_price || 0);
-        if (refundAmount > 0) {
-            // Get user's wallet
-            const walletResult = await query('SELECT id, balance FROM wallets WHERE user_id = $1', [order.client_user_id]);
-            
-            if (walletResult.rows.length > 0) {
-                const walletId = walletResult.rows[0].id;
-                const newBalance = parseFloat(walletResult.rows[0].balance || 0) + refundAmount;
-                
-                // Update wallet balance atomically
-                await query(
-                    'UPDATE wallets SET balance = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-                    [newBalance, walletId]
-                );
-
-                // Log refund in wallet_histories
-                await query(
-                    `INSERT INTO wallet_histories (wallet_id, type, price, remarks, status, created_at, updated_at, approved_date)
-                     VALUES ($1, 'Credit', $2, $3, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-                    [walletId, refundAmount, `Refund for rejected Order ${order.order_number || ('#' + orderId)}`]
-                );
-                
-                logger.info('Manager', `Refunded $${refundAmount} to user ${order.client_user_id} for rejected order ${orderId}`);
-            }
+        const refunded = await transaction(async (client) => {
+            const changed = (await client.query(
+                `UPDATE client_orders
+                 SET status = 'rejected', manager_notes = $1, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $2 AND status NOT IN ('rejected', 'completed')
+                 RETURNING id`,
+                [manager_notes || 'Order rejected by manager', orderId]
+            )).rows[0];
+            if (!changed) return null;
+            if (!(refundAmount > 0)) return 0;
+            const wallet = (await client.query(
+                'SELECT id FROM wallets WHERE user_id = $1 ORDER BY id DESC LIMIT 1 FOR UPDATE', [order.client_user_id]
+            )).rows[0];
+            if (!wallet) return 0;
+            await client.query('UPDATE wallets SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [refundAmount, wallet.id]);
+            await client.query(
+                `INSERT INTO wallet_histories (wallet_id, type, price, remarks, status, created_at, updated_at, approved_date)
+                 VALUES ($1, 'Credit', $2, $3, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                [wallet.id, refundAmount, `Refund for rejected Order ${order.order_number || ('#' + orderId)}`]
+            );
+            return refundAmount;
+        });
+        if (refunded === null) {
+            return res.status(400).json({ error: 'This order has already been rejected or completed' });
+        }
+        if (refunded > 0) {
+            logger.info('Manager', `Refunded $${refundAmount} to user ${order.client_user_id} for rejected order ${orderId}`);
+            // Marketplace clients get an email + notification (internal clients: no change)
+            notifyRefund({ clientUserId: order.client_user_id, amount: refunded, reason: manager_notes || 'Order rejected', what: `order ${order.order_number || ('#' + orderId)}` });
         }
 
         res.json({ message: 'Order rejected and refunded successfully' });

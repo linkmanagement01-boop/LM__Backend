@@ -35,8 +35,16 @@ const authenticate = async (req, res, next) => {
             role: decoded.role
         };
 
-        // An inactive blogger is signed out straight away, even with a still-valid token
-        if (String(decoded.role || '').toLowerCase() === 'blogger') {
+        // Client login to the dashboard is switched off: an already logged-in client is signed out on the next request
+        if (String(decoded.role || '').toLowerCase() === 'client' && process.env.CLIENT_LOGIN_ENABLED !== 'true') {
+            return res.status(401).json({
+                error: 'Unauthorized',
+                message: 'Client login is not available at the moment. Please contact your account manager.'
+            });
+        }
+
+        // An inactive blogger or client is signed out straight away, even with a still-valid token
+        if (['blogger', 'client'].includes(String(decoded.role || '').toLowerCase())) {
             // A failed lookup must not log the blogger out, so treat it as "still active"
             const statusResult = await query('SELECT status FROM users WHERE id = $1', [decoded.id])
                 .catch(err => { console.error('Blogger status check failed:', err.message); return null; });

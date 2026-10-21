@@ -59,6 +59,13 @@ router.get('/tasks/:id', writerController.getTaskById);
 router.post('/tasks/:id/submit-content', contentUpload.any(), writerController.submitContent);
 
 /**
+ * @route   POST /api/writer/tasks/:id/niche-suggestions/:detailId
+ * @desc    AI suggestion for one Niche Edit site (saved; { regenerate: true } makes a new one)
+ * @access  Writer only
+ */
+router.post('/tasks/:id/niche-suggestions/:detailId', writerController.getNicheSuggestion);
+
+/**
  * @route   PATCH /api/writer/tasks/:id/mark-in-progress
  * @desc    Mark task as in progress
  * @access  Writer only

@@ -30,6 +30,10 @@ router.get('/permissions', teamController.getMyPermissions);
 router.get('/order-notifications', teamController.getOrderNotifications);
 // Get specific order details for Push to Manager page
 router.get('/order-notifications/:id', teamController.getTaskForPush);
+// Keyword search over saved blog posts of sites within budget
+router.get('/order-notifications/:id/keyword-search', teamController.keywordSearch);
+router.post('/order-notifications/:id/keyword-scores', teamController.keywordScores);
+router.post('/order-notifications/:id/verify-post', teamController.verifyPost);
 // Submit selected websites for an order
 router.post('/order-notifications/:id/submit', teamController.submitWebsitesToManager);
 

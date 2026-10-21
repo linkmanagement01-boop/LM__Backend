@@ -4,6 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const adminController = require('../controllers/adminController');
+const marketplaceAdminController = require('../controllers/marketplaceAdminController');
 const adminSitesController = require('../controllers/adminSitesController');
 const managerController = require('../controllers/managerController');
 const adminReportController = require('../controllers/adminReportController');
@@ -113,6 +114,9 @@ router.put('/sites/pending-bulk/:id/reject', adminController.rejectBulkRequest);
 
 // ==================== SITES LIST (View All Sites) ====================
 router.get('/sites/list', adminController.getWebsitesList);
+// Marketplace pricing (editable price rules per marketplace)
+router.get('/marketplace/pricing', marketplaceAdminController.getPricing);
+router.put('/marketplace/pricing', marketplaceAdminController.updatePricing);
 router.get('/sites/deleted-list', adminController.getDeletedWebsitesList);
 router.put('/sites/:id/delete', adminController.deleteWebsite);
 router.put('/sites/:id/restore', adminController.restoreWebsite);

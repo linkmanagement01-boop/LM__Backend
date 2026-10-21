@@ -6,6 +6,7 @@ const User = require('../models/User');
 const Website = require('../models/Website');
 const { getAvailableBalance, getUnapprovedCreditsBalance } = require('../utils/walletService');
 const { query, transaction } = require('../config/database');
+const { notifyRefund } = require('../utils/marketplaceNotify');
 const { sendSiteAddedEmail } = require('../utils/emailService');
 
 /**
@@ -2012,6 +2013,11 @@ const rejectTask = async (req, res, next) => {
             return { allLinksResolved, allRejected, refundAmount, clientUserId };
         });
 
+        // Marketplace client: branded refund email (the in-app notification was already added above)
+        if (result.clientUserId && result.refundAmount > 0) {
+            notifyRefund({ clientUserId: result.clientUserId, amount: result.refundAmount, reason: rejection_reason, what: detail.root_domain, notification: false });
+        }
+
         const responseMessage = result.allLinksResolved
             ? (result.allRejected
                 ? 'Task rejected. All links in this order were rejected — order marked as Rejected and client refunded.'
@@ -2508,7 +2514,34 @@ const checkLinkStatus = async (req, res, next) => {
     }
 };
 
+/**
+ * @route   GET /api/blogger/guides
+ * @desc    Guide videos the admin added under More Links → Videos (active ones only)
+ * @access  Blogger
+ */
+const getGuides = async (req, res, next) => {
+    try {
+        const result = await query(
+            `SELECT id, title, link, created_at
+             FROM videos
+             WHERE COALESCE(active, true) = true
+             ORDER BY created_at DESC`
+        );
+        res.json({ guides: result.rows });
+    } catch (error) {
+        if (error.code === '42P01') return res.json({ guides: [] }); // admin hasn't added any videos yet
+        if (error.code === '42703') { // older DB without the "active" column: show every video
+            try {
+                const all = await query(`SELECT id, title, link, created_at FROM videos ORDER BY created_at DESC`);
+                return res.json({ guides: all.rows });
+            } catch (e) { return next(e); }
+        }
+        next(error);
+    }
+};
+
 module.exports = {
+    getGuides,
     getMyTasks,
     getTaskById,
     submitLiveLink,

@@ -1,5 +1,6 @@
 const Task = require('../models/Task');
 const { activeBloggerSql } = require('../utils/bloggerStatus');
+const nicheSuggest = require('../utils/nicheSuggest');
 
 /**
  * Writer Controller
@@ -714,7 +715,45 @@ const rejectTask = async (req, res, next) => {
     }
 };
 
+/**
+ * @route   POST /api/writer/tasks/:id/niche-suggestions/:detailId   { regenerate?: boolean }
+ * @desc    AI suggestion (OpenAI) for one Niche Edit site: text to replace + new text, and insert-after + new text.
+ *          Saved per site, so only "regenerate" spends money again.
+ * @access  Writer only (their own task, Niche Edit, sites they have to write)
+ */
+const getNicheSuggestion = async (req, res, next) => {
+    try {
+        const task = await Task.findById(req.params.id);
+        if (!task) return res.status(404).json({ error: 'Not Found', message: 'Task not found' });
+        if (String(task.assigned_writer_id) !== String(req.user.id)) {
+            return res.status(403).json({ error: 'Forbidden', message: 'You can only use tasks assigned to you' });
+        }
+        if (!String(task.order_type || '').toLowerCase().includes('niche')) {
+            return res.status(400).json({ error: 'Validation Error', message: 'Suggestions are only for Niche Edit orders' });
+        }
+        const detailId = parseInt(req.params.detailId, 10);
+        const site = (task.selected_websites || []).find(sw => Number(sw.id) === detailId && !sw.fill_details);
+        if (!site) return res.status(404).json({ error: 'Not Found', message: 'Site not found in this order' });
+
+        // The existing post: ourl (client / manager orders) or doc_urls (team picks); never the target URL
+        const { query } = require('../config/database');
+        const d = (await query(`SELECT ourl, doc_urls, url, anchor FROM new_order_process_details WHERE id = $1`, [detailId])).rows[0];
+        const isUrl = (v) => /^https?:\/\/\S+\.\S+/i.test(String(v || '').trim());
+        const postUrl = [d?.ourl, d?.doc_urls].map(v => String(v || '').trim()).find(v => isUrl(v) && v !== String(d?.url || '').trim());
+        if (!postUrl) return res.json({ suggestion: { detail_id: detailId, status: 'unreadable', message: 'This site has no post URL yet – please fill in manually.' } });
+        if (!String(d.anchor || '').trim()) return res.json({ suggestion: { detail_id: detailId, status: 'failed', message: 'This site has no anchor text yet.' } });
+
+        const suggestion = await nicheSuggest.suggestFor({
+            detailId, postUrl, anchor: String(d.anchor).trim(), targetUrl: String(d.url || '').trim(), regenerate: req.body?.regenerate === true
+        });
+        res.json({ suggestion });
+    } catch (error) {
+        next(error);
+    }
+};
+
 module.exports = {
+    getNicheSuggestion,
     getMyTasks,
     getTaskById,
     submitContent,
