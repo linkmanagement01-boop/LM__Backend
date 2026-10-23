@@ -211,19 +211,53 @@ const me = async (req, res, next) => {
 
 // ─── Sites ────────────────────────────────────────────────────────────
 
-const siteListWhere = `(ns.delete_site IS NULL OR ns.delete_site = 0) AND ns.site_status = '1' AND ${activeSiteSql('ns')}`;
+// The category a client sees (category, else niche) and its case-insensitive key
+const categorySql = `COALESCE(NULLIF(TRIM(ns.category), ''), NULLIF(TRIM(ns.niche), ''))`;
+const categoryKeySql = `LOWER(${categorySql})`;
+
+const siteListWhere =`(ns.delete_site IS NULL OR ns.delete_site = 0) AND ns.site_status = '1' AND ${activeSiteSql('ns')}`;
 const trafficSql = `(CASE WHEN ns.traffic_source::text ~ '^[0-9]+(\\.[0-9]+)?$' THEN ns.traffic_source::numeric ELSE 0 END)`;
 
 /**
  * @route GET /api/marketplace/:marketplace/sites
  * Query: search, category, min/max_da, min/max_dr, min/max_traffic, min/max_price, type (gp|ne), sort, page, limit
  */
+/**
+ * @route GET /api/marketplace/:marketplace/sites/categories?fc=1
+ * Categories of the sites a client can order (normal or FC prices), with counts.
+ * Spellings that differ only in capitals are merged; the most common spelling is shown.
+ */
+const getCategories = async (req, res, next) => {
+    try {
+        const fc = req.query.fc === '1' || req.query.fc === 'true';
+        const rules = await mp.getRules(marketplaceOf(req), fc ? 'fc' : 'normal');
+        const cols = mp.priceColumns(fc);
+        const gpPrice = mp.priceSql(`ns.${cols.gp}`, rules);
+        const nePrice = mp.priceSql(`ns.${cols.ne}`, rules);
+        const rows = (await query(
+            `SELECT (ARRAY_AGG(name ORDER BY c DESC, name))[1] AS name, SUM(c)::int AS count
+             FROM (SELECT ${categorySql} AS name, ${categoryKeySql} AS key, COUNT(*) AS c
+                   FROM new_sites ns
+                   WHERE ${siteListWhere} AND (${gpPrice} IS NOT NULL OR ${nePrice} IS NOT NULL) AND ${categorySql} IS NOT NULL
+                   GROUP BY 1, 2) t
+             GROUP BY key
+             ORDER BY count DESC, name`
+        )).rows;
+        res.json({ categories: rows });
+    } catch (error) {
+        next(error);
+    }
+};
+
 const getSites = async (req, res, next) => {
     try {
-        const rules = await mp.getRules(marketplaceOf(req));
-        const gpPrice = mp.priceSql('ns.gp_price', rules);
-        const nePrice = mp.priceSql('ns.niche_edit_price', rules);
         const q = req.query;
+        // FC = sites' FC prices (fc_gp / fc_ne) with the FC price rules; otherwise the normal prices
+        const fc = q.fc === '1' || q.fc === 'true';
+        const rules = await mp.getRules(marketplaceOf(req), fc ? 'fc' : 'normal');
+        const cols = mp.priceColumns(fc);
+        const gpPrice = mp.priceSql(`ns.${cols.gp}`, rules);
+        const nePrice = mp.priceSql(`ns.${cols.ne}`, rules);
         const page = Math.max(1, parseInt(q.page) || 1);
         const limit = Math.min(50, Math.max(1, parseInt(q.limit) || 25));
         const where = [siteListWhere, `(${gpPrice} IS NOT NULL OR ${nePrice} IS NOT NULL)`];
@@ -232,10 +266,8 @@ const getSites = async (req, res, next) => {
         const add = (cond, value) => { params.push(value); where.push(cond(`$${params.length}`)); };
 
         if (q.search) add(p => `ns.root_domain ILIKE ${p}`, `%${String(q.search).trim()}%`);
-        if (q.category) {
-            params.push(`%${String(q.category).trim()}%`);
-            where.push(`(ns.category ILIKE $${params.length} OR ns.niche ILIKE $${params.length})`);
-        }
+        // Category picked from the list (spellings that differ only in capitals count as one)
+        if (q.category) add(p => `${categoryKeySql} = LOWER(TRIM(${p}))`, String(q.category));
         const range = (col, min, max) => {
             if (min !== undefined && min !== '' && !isNaN(Number(min))) add(p => `${col} >= ${p}`, Number(min));
             if (max !== undefined && max !== '' && !isNaN(Number(max))) add(p => `${col} <= ${p}`, Number(max));
@@ -276,18 +308,29 @@ const getSites = async (req, res, next) => {
             gp_price: r.gp_price === null ? null : Number(r.gp_price),
             niche_edit_price: r.niche_edit_price === null ? null : Number(r.niche_edit_price)
         }));
-        // Whole-marketplace numbers (ignoring the client's filters) for the banner and the price hint
+        // Whole-marketplace numbers (ignoring the client's filters) for the banner – always the normal prices
+        const nRules = fc ? await mp.getRules(marketplaceOf(req), 'normal') : rules;
+        const nGp = fc ? mp.priceSql('ns.gp_price', nRules) : gpPrice;
+        const nNe = fc ? mp.priceSql('ns.niche_edit_price', nRules) : nePrice;
         const stats = (await query(
             `SELECT COUNT(*) AS sites, MAX(CASE WHEN ns.dr <= 100 THEN ns.dr END) AS top_dr, -- ignore impossible DR values
                     ROUND(AVG(CASE WHEN ns.dr > 0 AND ns.dr <= 100 THEN ns.dr END)) AS avg_dr,
-                    MIN(LEAST(COALESCE(${gpPrice}, 1e12), COALESCE(${nePrice}, 1e12))) AS min_price,
+                    MIN(LEAST(COALESCE(${nGp}, 1e12), COALESCE(${nNe}, 1e12))) AS min_price,
+                    MAX(GREATEST(COALESCE(${nGp}, 0), COALESCE(${nNe}, 0))) AS max_price
+             FROM new_sites ns WHERE ${siteListWhere} AND (${nGp} IS NOT NULL OR ${nNe} IS NOT NULL)`
+        )).rows[0];
+        // Price range of what's listed now (FC prices when FC is on) for the price filter hint
+        const range2 = fc ? (await query(
+            `SELECT COUNT(*) AS sites, MIN(LEAST(COALESCE(${gpPrice}, 1e12), COALESCE(${nePrice}, 1e12))) AS min_price,
                     MAX(GREATEST(COALESCE(${gpPrice}, 0), COALESCE(${nePrice}, 0))) AS max_price
              FROM new_sites ns WHERE ${siteListWhere} AND (${gpPrice} IS NOT NULL OR ${nePrice} IS NOT NULL)`
-        )).rows[0];
+        )).rows[0] : stats;
         res.json({
             sites: rows,
             pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
-            stats: { sites: parseInt(stats.sites), top_dr: Number(stats.top_dr) || 0, avg_dr: Number(stats.avg_dr) || 0, min_price: Number(stats.min_price) || 0, max_price: Number(stats.max_price) || 0 }
+            fc,
+            stats: { sites: parseInt(stats.sites), top_dr: Number(stats.top_dr) || 0, avg_dr: Number(stats.avg_dr) || 0, min_price: Number(stats.min_price) || 0, max_price: Number(stats.max_price) || 0 },
+            price_range: { sites: parseInt(range2.sites), min_price: Number(range2.min_price) || 0, max_price: Number(range2.max_price) || 0 }
         });
     } catch (error) {
         next(error);
@@ -295,24 +338,25 @@ const getSites = async (req, res, next) => {
 };
 
 /** Current marketplace price of one site for a type (null = not for sale / not available) */
-const priceFor = async (siteId, orderType, rules) => {
+const priceFor = async (siteId, orderType, rules, fc = false) => {
     const s = (await query(
-        `SELECT ns.id, ns.root_domain, ns.gp_price, ns.niche_edit_price FROM new_sites ns WHERE ns.id = $1 AND ${siteListWhere}`,
+        `SELECT ns.id, ns.root_domain, ns.gp_price, ns.niche_edit_price, ns.fc_gp, ns.fc_ne FROM new_sites ns WHERE ns.id = $1 AND ${siteListWhere}`,
         [siteId]
     )).rows[0];
     if (!s) return { site: null, price: null };
-    return { site: s, price: mp.applyRules(orderType === 'Guest Post' ? s.gp_price : s.niche_edit_price, rules) };
+    const cols = mp.priceColumns(fc);
+    return { site: s, price: mp.applyRules(orderType === 'Guest Post' ? s[cols.gp] : s[cols.ne], rules) };
 };
 
 // ─── Cart ─────────────────────────────────────────────────────────────
 
 const cartContents = async (clientId, marketplace) => {
-    const rules = await mp.getRules(marketplace);
+    const rulesByKind = { normal: await mp.getRules(marketplace, 'normal'), fc: await mp.getRules(marketplace, 'fc') };
     const items = (await query(
         `SELECT c.id, c.site_id, c.order_type, c.anchor_text, c.target_url, c.created_at,
                 c.content_by, c.doc_url, c.doc_name, c.reference_url, c.title_suggestion, c.word_count, c.category AS brief_category,
                 c.keywords, c.target_country, c.note, c.post_url, c.post_title,
-                ns.root_domain, ns.gp_price AS b_gp, ns.niche_edit_price AS b_ne, ns.da, ns.dr, ns.rd,
+                c.fc, ns.root_domain, ns.gp_price AS b_gp, ns.niche_edit_price AS b_ne, ns.fc_gp AS b_fc_gp, ns.fc_ne AS b_fc_ne, ns.da, ns.dr, ns.rd,
                 COALESCE(NULLIF(ns.category, ''), ns.niche) AS category,
                 (ns.id IS NOT NULL AND ${siteListWhere.replace(/ns\./g, 'ns.')}) AS available
          FROM marketplace_cart_items c
@@ -321,9 +365,11 @@ const cartContents = async (clientId, marketplace) => {
          ORDER BY c.created_at ASC`,
         [clientId]
     )).rows.map(r => {
-        const base = r.available ? mp.applyRules(r.order_type === 'Guest Post' ? r.b_gp : r.b_ne, rules) : null;
+        const isGP = r.order_type === 'Guest Post';
+        const blogger = r.fc ? (isGP ? r.b_fc_gp : r.b_fc_ne) : (isGP ? r.b_gp : r.b_ne);
+        const base = r.available ? mp.applyRules(blogger, rulesByKind[r.fc ? 'fc' : 'normal']) : null;
         const fee = writingFee(r);
-        const { b_gp, b_ne, ...rest } = r;
+        const { b_gp, b_ne, b_fc_gp, b_fc_ne, ...rest } = r;
         return { ...rest, base_price: base, writing_fee: fee, price: base === null ? null : base + fee, available: !!r.available && base !== null };
     });
     const total = items.filter(i => i.available).reduce((s, i) => s + i.price, 0);
@@ -406,22 +452,23 @@ const CART_COLUMNS = ['anchor_text', 'target_url', ...DETAIL_FIELDS];
 /** @route POST /api/marketplace/:marketplace/cart  { site_id, order_type, anchor_text, target_url, ...content details } */
 const addToCart = async (req, res, next) => {
     try {
-        const rules = await mp.getRules(marketplaceOf(req));
-        const { site, price } = await priceFor(parseInt(req.body.site_id), req.body.order_type, rules);
+        const fc = req.body.fc === true;
+        const rules = await mp.getRules(marketplaceOf(req), fc ? 'fc' : 'normal');
+        const { site, price } = await priceFor(parseInt(req.body.site_id), req.body.order_type, rules, fc);
         if (!site) return bad(res, 'This site is not available any more', 404);
-        if (price === null) return bad(res, `${site.root_domain} doesn't offer ${req.body.order_type}`);
+        if (price === null) return bad(res, `${site.root_domain} doesn't offer ${fc ? 'FC ' : ''}${req.body.order_type}`);
         const { error, fields } = cleanCartInput(req.body, req.body.order_type, site);
         if (error) return bad(res, error);
 
         const values = CART_COLUMNS.map(c => fields[c]);
         await query(
-            `INSERT INTO marketplace_cart_items (client_user_id, site_id, order_type, ${CART_COLUMNS.join(', ')})
-             VALUES ($1,$2,$3,${CART_COLUMNS.map((_, i) => `$${i + 4}`).join(',')})
-             ON CONFLICT (client_user_id, site_id, order_type)
+            `INSERT INTO marketplace_cart_items (client_user_id, site_id, order_type, fc, ${CART_COLUMNS.join(', ')})
+             VALUES ($1,$2,$3,$4,${CART_COLUMNS.map((_, i) => `$${i + 5}`).join(',')})
+             ON CONFLICT (client_user_id, site_id, order_type, fc)
              DO UPDATE SET ${CART_COLUMNS.map(c => `${c} = EXCLUDED.${c}`).join(', ')}, updated_at = NOW()`,
-            [req.client.id, site.id, req.body.order_type, ...values]
+            [req.client.id, site.id, req.body.order_type, fc, ...values]
         );
-        res.status(201).json({ message: `${site.root_domain} (${req.body.order_type}) added to cart`, ...(await cartContents(req.client.id, marketplaceOf(req))) });
+        res.status(201).json({ message: `${site.root_domain} (${fc ? 'FC ' : ''}${req.body.order_type}) added to cart`, ...(await cartContents(req.client.id, marketplaceOf(req))) });
     } catch (error) {
         next(error);
     }
@@ -523,23 +570,6 @@ const removeCartItem = async (req, res, next) => {
 
 // ─── Checkout ─────────────────────────────────────────────────────────
 
-/** Plain-text note for the team (writers/bloggers see the note field, not the brief JSON) */
-const teamNote = (type, i) => {
-    const parts = [];
-    if (type === 'Guest Post' && i.content_by === 'us') {
-        parts.push(`CONTENT BY US – please write the article (English, ${i.word_count} words, writing paid $${i.writing_fee})`);
-        parts.push(`Category: ${i.brief_category}`, `Keywords: ${i.keywords}`, `Target audience: ${i.target_country}`);
-        if (i.title_suggestion) parts.push(`Title suggestion: ${i.title_suggestion}`);
-    } else if (type === 'Guest Post') {
-        parts.push(`CONTENT PROVIDED BY CLIENT${i.doc_name ? ` (file: ${i.doc_name})` : ''}: ${i.doc_url}`);
-    } else {
-        parts.push(`Existing post: ${i.post_url}`);
-    }
-    if (i.reference_url) parts.push(`Reference: ${i.reference_url}`);
-    if (i.note) parts.push(`Client note: ${i.note}`);
-    return parts.join('\n');
-};
-
 /** Next manager in the round-robin used by the existing client orders */
 const nextManager = async (client) => {
     const managers = (await client.query(`SELECT id FROM users WHERE role = 'manager' AND status = 1 ORDER BY id ASC`)).rows.map(r => parseInt(r.id, 10));
@@ -590,20 +620,20 @@ const checkout = async (req, res, next) => {
                 [marketplace, clientId, orderNumber, total]
             )).rows[0];
 
-            // One client_order per type for the team (their flow handles one type per order)
+            // One client_order per type (and normal / FC) for the team – their flow handles one type + one price list per order
             const managerId = await nextManager(client);
-            for (const type of ORDER_TYPES) {
-                const group = items.filter(i => i.order_type === type);
+            for (const [type, fc] of ORDER_TYPES.flatMap(t => [[t, false], [t, true]])) {
+                const group = items.filter(i => i.order_type === type && !!i.fc === fc);
                 if (!group.length) continue;
                 const groupTotal = Math.round(group.reduce((s, i) => s + i.price, 0) * 100) / 100;
                 // fill_details = false only for "write the content for us" – those go to a writer
                 const rows = group.map(i => ({ ...i, fill: !(type === 'Guest Post' && i.content_by === 'us') }));
                 const co = (await client.query(
                     `INSERT INTO client_orders (client_user_id, order_type, no_of_links, status, fill_details, notes, order_package, category,
-                                                total_price, assigned_to, assigned_at, created_at, order_number, marketplace, marketplace_order_id)
-                     VALUES ($1,$2,$3,'pending_review',$11,$4,'','',$5,$6,$7,NOW(),$8,$9,$10) RETURNING id`,
+                                                total_price, assigned_to, assigned_at, created_at, order_number, marketplace, marketplace_order_id, fc)
+                     VALUES ($1,$2,$3,'pending_review',$11,$4,'','',$5,$6,$7,NOW(),$8,$9,$10,$12) RETURNING id`,
                     [clientId, type, group.length, `Marketplace order ${orderNumber}`, groupTotal, managerId, managerId ? new Date() : null,
-                        `${orderNumber}-${type === 'Guest Post' ? 'GP' : 'NE'}`, marketplace, mOrder.id, rows.every(r => r.fill)]
+                        `${orderNumber}-${type === 'Guest Post' ? 'GP' : 'NE'}${fc ? '-FC' : ''}`, marketplace, mOrder.id, rows.every(r => r.fill), fc ? 1 : 0]
                 )).rows[0];
                 for (const i of rows) {
                     const brief = type === 'Guest Post' && i.content_by === 'us'
@@ -614,7 +644,7 @@ const checkout = async (req, res, next) => {
                                                            fill_details, content_by, brief, price, created_at)
                          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())`,
                         [co.id, i.site_id, i.target_url, i.anchor_text, i.title_suggestion || '', i.doc_url || '', i.post_url || '',
-                            teamNote(type, i), i.fill, type === 'Guest Post' ? i.content_by : null, brief ? JSON.stringify(brief) : null, i.price]
+                            i.note || '', i.fill, type === 'Guest Post' ? i.content_by : null, brief ? JSON.stringify(brief) : null, i.price]
                     );
                 }
             }
@@ -1013,7 +1043,7 @@ module.exports = {
     uploadContent, getSitePosts, WRITING_FEES,
     checkMarketplace, requireClient,
     sendSignupCode, verifySignupCode, login, me,
-    getSites, getCart, addToCart, updateCartItem, removeCartItem, checkout,
+    getSites, getCategories, getCart, addToCart, updateCartItem, removeCartItem, checkout,
     getOrders, getOrder, getWallet, createPaypalTopup, capturePaypalTopup,
     getNotifications, markNotificationsRead
 };

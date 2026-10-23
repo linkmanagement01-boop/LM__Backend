@@ -50,6 +50,7 @@ router.post('/:marketplace/auth/login', authLimiter, m.login);
 // Logged-in marketplace clients
 router.get('/:marketplace/me', m.requireClient, m.me);
 router.get('/:marketplace/sites', m.requireClient, m.getSites);
+router.get('/:marketplace/sites/categories', m.requireClient, m.getCategories);
 router.get('/:marketplace/sites/:id/posts', m.requireClient, m.getSitePosts);
 router.post('/:marketplace/uploads/content', m.requireClient, uploadOne, m.uploadContent);
 
