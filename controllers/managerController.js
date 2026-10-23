@@ -2980,6 +2980,7 @@ const getClientOrders = async (req, res, next) => {
                     am.name as assigned_manager_name,
                     (SELECT ns.root_domain FROM client_order_details cod LEFT JOIN new_sites ns ON ns.id = cod.site_id WHERE cod.client_order_id = co.id LIMIT 1) as client_website,
                     (SELECT COUNT(*) FROM client_order_details cod WHERE cod.client_order_id = co.id) as site_count,
+                    (SELECT ARRAY(SELECT ns.root_domain FROM client_order_details cod LEFT JOIN new_sites ns ON ns.id = cod.site_id WHERE cod.client_order_id = co.id ORDER BY cod.id LIMIT 4)) as domains,
                     (SELECT nop.status FROM new_order_processes nop WHERE nop.new_order_id = co.linked_new_order_id ORDER BY nop.id DESC LIMIT 1) as linked_process_status,
                     (SELECT w.name FROM new_order_processes nop LEFT JOIN users w ON nop.writer_id = w.id WHERE nop.new_order_id = co.linked_new_order_id ORDER BY nop.id DESC LIMIT 1) as assigned_writer_name,
                     (SELECT COUNT(*) FROM new_order_process_details nopd JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id WHERE nop.new_order_id = co.linked_new_order_id AND nopd.status = 7) as pending_blogger_submissions_count,
@@ -3085,7 +3086,7 @@ const getClientOrderDetails = async (req, res, next) => {
         }
 
         const detailsResult = await query(
-            `SELECT cod.id, cod.client_order_id, cod.site_id, cod.fill_details,
+            `SELECT cod.id, cod.client_order_id, cod.site_id, cod.fill_details, cod.price,
                     to_jsonb(cod)->>'content_by' AS content_by, to_jsonb(cod)->'brief' AS brief, -- marketplace columns; null if not created yet
                     COALESCE(nopd.url, cod.target_url) as target_url,
                     COALESCE(nopd.anchor, cod.anchor_text) as anchor_text,
@@ -3143,8 +3144,44 @@ const updateClientOrder = async (req, res, next) => {
         }
 
         // Get client order
-        const orderResult = await query('SELECT linked_new_order_id FROM client_orders WHERE id = $1', [orderId]);
+        const orderResult = await query('SELECT linked_new_order_id, status, order_type FROM client_orders WHERE id = $1', [orderId]);
         const linkedNewOrderId = orderResult.rows[0]?.linked_new_order_id;
+        const orderStatus = orderResult.rows[0]?.status;
+        const isGuestPostOrder = /guest/i.test(orderResult.rows[0]?.order_type || '');
+
+        // Marketplace Guest Posts: who writes the content + the writing brief. Only while the order is still
+        // in review – switching to "we write it" makes the site Delegated so it goes to a writer.
+        const BRIEF_KEYS = ['word_count', 'category', 'keywords', 'target_country', 'title_suggestion', 'reference_url', 'language', 'writing_fee'];
+        if (details && Array.isArray(details) && isGuestPostOrder && orderStatus === 'pending_review') {
+            for (const d of details) {
+                if (d.content_by === undefined && d.brief === undefined) continue;
+                const contentBy = ['client', 'us'].includes(d.content_by) ? d.content_by : null;
+                let brief = null;
+                if (d.brief && typeof d.brief === 'object') {
+                    brief = {};
+                    for (const k of BRIEF_KEYS) {
+                        const v = d.brief[k];
+                        if (v === undefined || v === null || String(v).trim() === '') continue;
+                        brief[k] = k === 'word_count' || k === 'writing_fee' ? (Number(v) || null) : String(v).trim().slice(0, 1000);
+                    }
+                }
+                await query(
+                    `UPDATE client_order_details
+                     SET content_by = COALESCE($1, content_by),
+                         brief = COALESCE($2::jsonb, brief),
+                         fill_details = CASE WHEN $1 IS NULL THEN fill_details ELSE ($1 <> 'us') END
+                     WHERE id = $3 AND client_order_id = $4`,
+                    [contentBy, brief ? JSON.stringify(brief) : null, d.id, orderId]
+                );
+            }
+            // Order is "self-filled" only when no site needs a writer
+            await query(
+                `UPDATE client_orders SET fill_details = NOT EXISTS (
+                     SELECT 1 FROM client_order_details WHERE client_order_id = $1 AND fill_details = false)
+                 WHERE id = $1`,
+                [orderId]
+            );
+        }
 
         // Update individual site details
         if (details && Array.isArray(details)) {
@@ -3282,6 +3319,32 @@ const rejectClientOrder = async (req, res, next) => {
  * @desc    Push a client order to the normal order flow (creates new_orders + pushes to blogger)
  * @access  Manager only
  */
+/**
+ * Note the writer / blogger receives for one client-order site: the marketplace writing brief (as saved now,
+ * including manager edits) followed by the note itself.
+ */
+const teamNoteFor = (d) => {
+    let brief = d.brief;
+    if (typeof brief === 'string') { try { brief = JSON.parse(brief); } catch { brief = null; } }
+    const lines = [];
+    if (d.content_by === 'us' && brief && String(d.doc_url || '').trim()) {
+        // Our team already wrote it (Guest Posts reach the blogger with the doc link)
+        lines.push(`ARTICLE WRITTEN BY OUR TEAM – publish it from the doc link${d.article_title ? ` (title: ${d.article_title})` : ''}`);
+    } else if (d.content_by === 'us' && brief) {
+        lines.push(`CONTENT BY US – please write the article (${brief.language || 'English'}${brief.word_count ? `, ${brief.word_count} words` : ''})`);
+        if (brief.title_suggestion) lines.push(`Title suggestion: ${brief.title_suggestion}`);
+        if (brief.category) lines.push(`Category: ${brief.category}`);
+        if (brief.keywords) lines.push(`Keywords: ${brief.keywords}`);
+        if (brief.target_country) lines.push(`Target audience: ${brief.target_country}`);
+    } else if (d.content_by === 'client') {
+        lines.push('CONTENT PROVIDED BY CLIENT – see the doc link');
+    }
+    if (brief && brief.reference_url) lines.push(`Reference: ${brief.reference_url}`);
+    const note = String(d.note || '').trim();
+    if (note) lines.push(lines.length ? `Note: ${note}` : note);
+    return lines.join('\n');
+};
+
 const pushClientOrderToBlogger = async (req, res, next) => {
     try {
         const clientOrderId = req.params.id;
@@ -3303,15 +3366,16 @@ const pushClientOrderToBlogger = async (req, res, next) => {
 
         const clientOrder = orderResult.rows[0];
 
-        if (clientOrder.status === 'pushed_to_blogger' || clientOrder.status === 'completed') {
+        // Direct push only from review (an order with a writer is pushed through the writer-approved flow)
+        if (clientOrder.status !== 'pending_review') {
             return res.status(400).json({ error: 'This order has already been processed' });
         }
 
         // Get the order details
         const detailsResult = await query(
             `SELECT cod.*, ns.root_domain, ns.uploaded_user_id as vendor_id, ns.email as site_email, ns.gp_price, ns.niche_edit_price
-             FROM client_order_details cod 
-             LEFT JOIN new_sites ns ON ns.id = cod.site_id 
+             FROM client_order_details cod
+             LEFT JOIN new_sites ns ON ns.id = cod.site_id
              WHERE cod.client_order_id = $1`,
             [clientOrderId]
         );
@@ -3323,6 +3387,25 @@ const pushClientOrderToBlogger = async (req, res, next) => {
         const inactiveSites = await findInactiveBloggerSites(detailsResult.rows.map(d => d.site_id));
         if (inactiveSites.length > 0) {
             return res.status(400).json({ error: inactiveSitesMessage(inactiveSites) });
+        }
+
+        // The blogger must get everything: the article (GP) or the existing post (Niche Edit)
+        const isGuestPostOrder = (clientOrder.order_type || '').toLowerCase().includes('guest');
+        for (const d of detailsResult.rows) {
+            const site = d.root_domain || `site #${d.site_id}`;
+            if (!String(d.anchor_text || '').trim() || !String(d.target_url || '').trim()) {
+                return res.status(400).json({ error: `Add the anchor text and target URL for ${site} before pushing` });
+            }
+            if (isGuestPostOrder) {
+                if (!String(d.doc_url || '').trim()) {
+                    return res.status(400).json({ error: `Add the article doc link for ${site} before pushing to the blogger` });
+                }
+                if (d.content_by === 'us' && !String(d.article_title || '').trim()) {
+                    return res.status(400).json({ error: `Add the article title for ${site} before pushing to the blogger` });
+                }
+            } else if (!String(d.post_url || '').trim()) {
+                return res.status(400).json({ error: `Add the post URL for ${site} before pushing to the blogger` });
+            }
         }
 
         // Resolve correct vendor_id — fallback via case-insensitive email if site is wrongly under admin
@@ -3347,9 +3430,9 @@ const pushClientOrderToBlogger = async (req, res, next) => {
 
         // Create the standard order
         const newOrderResult = await query(
-            `INSERT INTO new_orders (manager_id, team_id, order_id, client_name, client_website, no_of_links, order_type, order_package, message, category, new_order_status, type, created_at, updated_at)
-             VALUES ($1, 0, $2, $3, '', $4, $5, $6, $7, $8, 4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`,
-            [managerId, orderId, clientOrder.client_name_user || 'Client', detailsResult.rows.length, clientOrder.order_type, clientOrder.order_package || '', clientOrder.notes || '', clientOrder.category || '']
+            `INSERT INTO new_orders (manager_id, team_id, order_id, client_name, client_website, no_of_links, order_type, order_package, message, category, new_order_status, type, fc, created_at, updated_at)
+             VALUES ($1, 0, $2, $3, '', $4, $5, $6, $7, $8, 4, $5, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`,
+            [managerId, orderId, clientOrder.client_name_user || 'Client', detailsResult.rows.length, clientOrder.order_type, clientOrder.order_package || '', clientOrder.notes || '', clientOrder.category || '', Number(clientOrder.fc) === 1 ? 1 : 0]
         );
         const newOrderId = newOrderResult.rows[0].id;
 
@@ -3368,8 +3451,8 @@ const pushClientOrderToBlogger = async (req, res, next) => {
                 `INSERT INTO new_order_process_details 
                  (new_order_process_id, new_site_id, url, anchor, title, note, doc_urls, ourl, insert_after, statement, price, vendor_id, status, type, created_at, updated_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, 5, $12, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-                [processId, d.site_id, d.target_url || '', d.anchor_text || '', d.article_title || '', d.note || '',
-                 d.doc_url || '', d.post_url || '', d.insert_after || '', d.insert_statement || '',
+                [processId, d.site_id, d.target_url || '', d.anchor_text || '', d.article_title || '', teamNoteFor(d),
+                 d.doc_url || (isNicheEdit ? d.post_url : '') || '', d.post_url || '', d.insert_after || '', d.insert_statement || '',
                  d.vendor_id, isNicheEdit ? 'insert' : 'insert']
             );
 
@@ -3494,9 +3577,10 @@ const sendClientOrderToWriter = async (req, res, next) => {
             }
         }
 
-        const hasDelegated = detailsResult.rows.some(d => !d.fill_details);
-        if (!hasDelegated) {
-            return res.status(400).json({ error: 'Only orders containing at least one delegated website can be sent to a writer' });
+        // Client orders: only Niche Edits go to a writer (the writer prepares the insert/replace text).
+        // Guest Posts go straight to the blogger with the article doc link.
+        if (!(clientOrder.order_type || '').toLowerCase().includes('niche')) {
+            return res.status(400).json({ error: 'Guest Post client orders go directly to the blogger – add the article doc link and push to blogger' });
         }
 
         // Verify all sites have a vendor/owner
@@ -3511,40 +3595,46 @@ const sendClientOrderToWriter = async (req, res, next) => {
         const orderId = `CLT-WRT-${clientOrderId}-${Date.now()}`;
         const isNicheEdit = (clientOrder.order_type || '').toLowerCase().includes('niche');
 
-        // Create the standard order task (status: 3 = Assigned to Writer)
-        const newOrderResult = await query(
-            `INSERT INTO new_orders (manager_id, team_id, order_id, client_name, client_website, no_of_links, order_type, order_package, message, category, new_order_status, type, created_at, updated_at)
-             VALUES ($1, 0, $2, $3, '', $4, $5, $6, $7, $8, 3, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`,
-            [managerId, orderId, clientOrder.client_name_user || 'Client', detailsResult.rows.length, clientOrder.order_type, clientOrder.order_package || '', instructions || clientOrder.notes || '', clientOrder.category || '']
-        );
-        const newOrderId = newOrderResult.rows[0].id;
-
-        // Create the process record (status: 3 = Assigned to Writer, with writer_id)
-        const processResult = await query(
-            `INSERT INTO new_order_processes (new_order_id, team_id, writer_id, manager_id, status, note, statement, created_at, updated_at) 
-             VALUES ($1, 0, $2, $3, 3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`,
-            [newOrderId, writer_id, managerId, clientOrder.manager_notes || clientOrder.notes || '', instructions || '']
-        );
-        const processId = processResult.rows[0].id;
-
-        // Create process details for each site
-        for (const d of detailsResult.rows) {
-            const detailStatus = d.fill_details ? 4 : 3;
-            await query(
-                `INSERT INTO new_order_process_details 
-                 (new_order_process_id, new_site_id, url, anchor, title, note, doc_urls, ourl, insert_after, statement, price, vendor_id, status, type, fill_details, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, $12, $13, $14, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-                [processId, d.site_id, d.target_url || '', d.anchor_text || '', d.article_title || '', d.note || '',
-                 d.doc_url || '', d.post_url || '', d.insert_after || '', d.insert_statement || '',
-                 d.vendor_id, detailStatus, isNicheEdit ? 'insert' : 'insert', d.fill_details]
+        // All-or-nothing: a failure part-way must not leave a half-created order behind
+        let newOrderId;
+        await transaction(async (tx) => {
+            // Create the standard order task (status: 3 = Assigned to Writer)
+            const newOrderResult = await tx.query(
+                `INSERT INTO new_orders (manager_id, team_id, order_id, client_name, client_website, no_of_links, order_type, order_package, message, category, new_order_status, type, fc, created_at, updated_at)
+                 VALUES ($1, 0, $2, $3, '', $4, $5, $6, $7, $8, 3, $5, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`,
+                [managerId, orderId, clientOrder.client_name_user || 'Client', detailsResult.rows.length, clientOrder.order_type, clientOrder.order_package || '', instructions || clientOrder.notes || '', clientOrder.category || '', Number(clientOrder.fc) === 1 ? 1 : 0]
             );
-        }
+            newOrderId = newOrderResult.rows[0].id;
 
-        // Update client order status and link the new_order_id
-        await query(
-            `UPDATE client_orders SET status = 'sent_to_writer', linked_new_order_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-            [newOrderId, clientOrderId]
-        );
+            // Create the process record (status: 3 = Assigned to Writer, with writer_id)
+            const processResult = await tx.query(
+                `INSERT INTO new_order_processes (new_order_id, team_id, writer_id, manager_id, status, note, statement, created_at, updated_at) 
+                 VALUES ($1, 0, $2, $3, 3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id`,
+                [newOrderId, writer_id, managerId, clientOrder.manager_notes || clientOrder.notes || '', instructions || '']
+            );
+            const processId = processResult.rows[0].id;
+
+            // Create process details for each site
+            for (const d of detailsResult.rows) {
+                const detailStatus = 3; // writer works on every Niche Edit site
+                await tx.query(
+                    `INSERT INTO new_order_process_details 
+                     (new_order_process_id, new_site_id, url, anchor, title, note, doc_urls, ourl, insert_after, statement, price, vendor_id, status, type, fill_details, created_at, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, $12, $13, $14, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                    [processId, d.site_id, d.target_url || '', d.anchor_text || '', d.article_title || '', teamNoteFor(d),
+                     // the writer page reads the existing post from doc_urls, so store the post URL there too
+                     d.post_url || d.doc_url || '', d.post_url || '', d.insert_after || '', d.insert_statement || '',
+                     d.vendor_id, detailStatus, isNicheEdit ? 'insert' : 'insert', false]
+                );
+            }
+
+            // Update client order status and link the new_order_id
+            await tx.query(
+                `UPDATE client_orders SET status = 'sent_to_writer', linked_new_order_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+                [newOrderId, clientOrderId]
+            );
+
+        });
 
         res.json({
             message: 'Client order delegated to writer successfully',

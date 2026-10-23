@@ -19,7 +19,8 @@ const zlib = require('zlib');
 const { query } = require('../config/database');
 const { activeSiteSql } = require('../utils/bloggerStatus');
 
-const MAX_POSTS_PER_SITE = 2000;
+// Newest posts kept per site (keeps the database small: ~400 MB for all sites at 400, vs ~1.3 GB at 2000). Override: POST_INDEXER_MAX_PER_SITE
+const MAX_POSTS_PER_SITE = Math.max(50, parseInt(process.env.POST_INDEXER_MAX_PER_SITE, 10) || 400);
 const CONCURRENCY = 6;
 const TIMEOUT_MS = 15000;
 const MAX_SITEMAP_BYTES = 15 * 1024 * 1024;

@@ -11,6 +11,7 @@ const { query } = require('../config/database');
 
 const MARKETPLACES = ['whitelabel']; // later: 'india', 'international'
 const DEFAULT_MARKETPLACE = 'whitelabel';
+const RULE_KINDS = ['normal', 'fc'];
 
 // Starting tiers (admin can change them on Admin → Marketplace Pricing)
 const DEFAULT_RULES = [
@@ -80,6 +81,8 @@ const ensureSchema = () => (schemaReady = schemaReady || (async () => {
             ADD COLUMN IF NOT EXISTS note TEXT,
             ADD COLUMN IF NOT EXISTS post_url TEXT,                 -- NE: existing post the link goes into
             ADD COLUMN IF NOT EXISTS post_title TEXT`);
+    // Client orders sent to a writer mark which sites the writer must work on (no default: older rows stay NULL = shown)
+    await query(`ALTER TABLE new_order_process_details ADD COLUMN IF NOT EXISTS fill_details BOOLEAN`);
     // The same details on the team's order rows
     await query(`
         ALTER TABLE client_order_details
@@ -105,29 +108,43 @@ const ensureSchema = () => (schemaReady = schemaReady || (async () => {
     await query(`ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS paypal_capture_id VARCHAR(64)`);
     await query(`CREATE UNIQUE INDEX IF NOT EXISTS client_payments_paypal_order_uq ON client_payments (paypal_order_id) WHERE paypal_order_id IS NOT NULL`);
 
-    // Seed the starting price tiers once per marketplace
+    // Two rule sets per marketplace: normal prices and FC prices (sites' fc_gp / fc_ne)
+    await query(`ALTER TABLE marketplace_price_rules ADD COLUMN IF NOT EXISTS kind VARCHAR(10) NOT NULL DEFAULT 'normal'`);
+    // FC orders: the cart line and the team's order remember that FC prices apply
+    await query(`ALTER TABLE marketplace_cart_items ADD COLUMN IF NOT EXISTS fc BOOLEAN NOT NULL DEFAULT false`);
+    await query(`DROP INDEX IF EXISTS marketplace_cart_items_uq`);
+    await query(`CREATE UNIQUE INDEX IF NOT EXISTS marketplace_cart_items_fc_uq ON marketplace_cart_items (client_user_id, site_id, order_type, fc)`);
+    await query(`ALTER TABLE client_orders ADD COLUMN IF NOT EXISTS fc INT NOT NULL DEFAULT 0`);
+
+    // Seed the starting price tiers once per marketplace and kind (FC starts with the same tiers)
     for (const mp of MARKETPLACES) {
-        const has = (await query(`SELECT 1 FROM marketplace_price_rules WHERE marketplace = $1 LIMIT 1`, [mp])).rows.length;
-        if (!has) {
-            for (const r of DEFAULT_RULES) {
-                await query(
-                    `INSERT INTO marketplace_price_rules (marketplace, min_price, max_price, mode, value) VALUES ($1,$2,$3,$4,$5)`,
-                    [mp, r.min_price, r.max_price, r.mode, r.value]
-                );
+        for (const kind of RULE_KINDS) {
+            const has = (await query(`SELECT 1 FROM marketplace_price_rules WHERE marketplace = $1 AND kind = $2 LIMIT 1`, [mp, kind])).rows.length;
+            if (!has) {
+                for (const r of DEFAULT_RULES) {
+                    await query(
+                        `INSERT INTO marketplace_price_rules (marketplace, kind, min_price, max_price, mode, value) VALUES ($1,$2,$3,$4,$5,$6)`,
+                        [mp, kind, r.min_price, r.max_price, r.mode, r.value]
+                    );
+                }
             }
         }
     }
 })().catch(err => { schemaReady = null; throw err; }));
 
 // ─── Pricing ──────────────────────────────────────────────────────────
-const getRules = async (marketplace) => {
+/** Price rules of one marketplace; kind 'normal' (gp_price / niche_edit_price) or 'fc' (fc_gp / fc_ne) */
+const getRules = async (marketplace, kind = 'normal') => {
     await ensureSchema();
     return (await query(
         `SELECT id, min_price::float AS min_price, max_price::float AS max_price, mode, value::float AS value
-         FROM marketplace_price_rules WHERE marketplace = $1 ORDER BY min_price ASC`,
-        [marketplace]
+         FROM marketplace_price_rules WHERE marketplace = $1 AND kind = $2 ORDER BY min_price ASC`,
+        [marketplace, RULE_KINDS.includes(kind) ? kind : 'normal']
     )).rows;
 };
+
+/** Blogger price columns for normal or FC orders */
+const priceColumns = (fc) => (fc ? { gp: 'fc_gp', ne: 'fc_ne' } : { gp: 'gp_price', ne: 'niche_edit_price' });
 
 /** Blogger price text ("$15", "N/A", "0") → number, or null when not sellable */
 const parsePrice = (v) => {
@@ -187,5 +204,5 @@ const getBrand = (marketplace = DEFAULT_MARKETPLACE) => {
 };
 
 module.exports = {
-    MARKETPLACES, DEFAULT_MARKETPLACE, ensureSchema, getRules, applyRules, parsePrice, validateRules, priceSql, getBrand
+    MARKETPLACES, DEFAULT_MARKETPLACE, RULE_KINDS, ensureSchema, getRules, priceColumns, applyRules, parsePrice, validateRules, priceSql, getBrand
 };
