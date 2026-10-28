@@ -149,6 +149,9 @@ const getTasks = async (req, res, next) => {
         // Support both 'current_status' (used by frontend) and 'status' (legacy)
         if (current_status) filters.current_status = current_status;
         else if (status) filters.current_status = status;
+        // Pending Approval → Writers also lists client orders a writer has finished
+        // (the manager reviews them and pushes to the blogger like any other order)
+        if (filters.current_status === 'PENDING_MANAGER_APPROVAL_2') filters.exclude_client_orders = false;
 
         const tasks = await Task.findAll(filters);
 
@@ -269,6 +272,8 @@ const getOrders = async (req, res, next) => {
                         WHEN o.new_order_status = 1 THEN 'Pending'
                         WHEN o.new_order_status = 2 THEN 'In Progress'
                         WHEN o.new_order_status = 3 THEN 'With Writer'
+                        -- status 4 is also set when a writer submits: still waiting for the manager until the order process reaches the blogger
+                        WHEN o.new_order_status = 4 AND (SELECT nop.status FROM new_order_processes nop WHERE nop.new_order_id = o.id ORDER BY nop.id DESC LIMIT 1) = 4 THEN 'Awaiting Approval'
                         WHEN o.new_order_status = 4 THEN 'With Blogger'
                         WHEN o.new_order_status = 5 THEN 'Completed'
                         WHEN o.new_order_status = 6 THEN 'Rejected'
@@ -329,6 +334,8 @@ const getOrders = async (req, res, next) => {
                         WHEN o.new_order_status = 1 THEN 'Pending'
                         WHEN o.new_order_status = 2 THEN 'In Progress'
                         WHEN o.new_order_status = 3 THEN 'With Writer'
+                        -- status 4 is also set when a writer submits: still waiting for the manager until the order process reaches the blogger
+                        WHEN o.new_order_status = 4 AND (SELECT nop.status FROM new_order_processes nop WHERE nop.new_order_id = o.id ORDER BY nop.id DESC LIMIT 1) = 4 THEN 'Awaiting Approval'
                         WHEN o.new_order_status = 4 THEN 'With Blogger'
                         WHEN o.new_order_status = 5 THEN 'Completed'
                         WHEN o.new_order_status = 6 THEN 'Rejected'
@@ -832,6 +839,8 @@ const getOrderDetails = async (req, res, next) => {
                     WHEN o.new_order_status = 1 THEN 'Pending'
                     WHEN o.new_order_status = 2 THEN 'In Progress'
                     WHEN o.new_order_status = 3 THEN 'With Writer'
+                    -- status 4 is also set when a writer submits: still waiting for the manager until the order process reaches the blogger
+                    WHEN o.new_order_status = 4 AND (SELECT nop.status FROM new_order_processes nop WHERE nop.new_order_id = o.id ORDER BY nop.id DESC LIMIT 1) = 4 THEN 'Awaiting Approval'
                     WHEN o.new_order_status = 4 THEN 'With Blogger'
                     WHEN o.new_order_status = 5 THEN 'Completed'
                     WHEN o.new_order_status = 6 THEN 'Rejected'
@@ -1719,10 +1728,11 @@ const getPendingFromWriters = async (req, res, next) => {
     try {
         // Use database-level filtering with current_status to apply dual-status checking
         // Both SUBMITTED_TO_MANAGER and PENDING_MANAGER_APPROVAL_2 map to status 4
+        // Client orders sent to a writer come back here too, so the manager reviews the writer's work
+        // and pushes it to the blogger from the same place as every other order
         const orders = await Task.findAll({
             manager_id: req.user.id,
-            current_status: 'PENDING_MANAGER_APPROVAL_2',
-            exclude_client_orders: true
+            current_status: 'PENDING_MANAGER_APPROVAL_2'
         });
 
         res.json({
@@ -3624,7 +3634,9 @@ const sendClientOrderToWriter = async (req, res, next) => {
                     [processId, d.site_id, d.target_url || '', d.anchor_text || '', d.article_title || '', teamNoteFor(d),
                      // the writer page reads the existing post from doc_urls, so store the post URL there too
                      d.post_url || d.doc_url || '', d.post_url || '', d.insert_after || '', d.insert_statement || '',
-                     d.vendor_id, detailStatus, isNicheEdit ? 'insert' : 'insert', false]
+                     // no blogger yet: the site's owner is attached only when the manager pushes to the blogger
+                     // (the blogger's task list shows every row with their vendor_id)
+                     null, detailStatus, isNicheEdit ? 'insert' : 'insert', false]
                 );
             }
 
