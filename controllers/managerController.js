@@ -890,7 +890,7 @@ const getOrderDetails = async (req, res, next) => {
              LEFT JOIN users w ON nop.writer_id = w.id
              WHERE nop.new_order_id = $1
              ORDER BY nop.created_at ASC`,
-            [id]
+            [numericId]
         );
 
         const allProcesses = allProcessesResult.rows;
