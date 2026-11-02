@@ -95,6 +95,7 @@ router.get('/sites/:id/traffic', siteTrafficController.getSiteTraffic);
 router.post('/sites/:id/traffic', siteTrafficController.saveSiteTraffic);
 // Suggestions page (status rules after Ahrefs checks)
 router.get('/sites/traffic-suggestions', siteTrafficController.getTrafficSuggestions);
+router.get('/sites/traffic-queue', siteTrafficController.getTrafficQueue);
 router.get('/sites/traffic-suggestions/counts', siteTrafficController.getTrafficSuggestionCounts);
 router.post('/sites/:id/traffic-decision', siteTrafficController.decideTrafficSuggestion);
 

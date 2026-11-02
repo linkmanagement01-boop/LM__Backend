@@ -170,6 +170,46 @@ const get = async (siteId) => {
     return r.rows[0] || null;
 };
 
+// ─── Check queue (View All Sites buttons) ─────────────────────────────
+
+const RECHECK_MIN_DAYS = 7;
+const STATUS_CODES = { Approved: '1', Rejected: '2', Pending: '0' };
+
+/**
+ * Next sites for "Check 10 unchecked" / "Re-check 10", over the whole list (not one page).
+ *   unchecked: never checked, newest added first
+ *   recheck:   last checked more than RECHECK_MIN_DAYS ago, oldest check first – so repeated clicks go through
+ *              every site and then start again
+ * status = 'Approved' | 'Rejected' | 'Pending' | '' (all) – the list the person is looking at.
+ * Returns { sites: [{ id, root_domain }], unchecked, recheck_due, recheck_min_days }
+ */
+const queue = async ({ type, status, limit = 10 }) => {
+    await ensureSchema();
+    const { activeSiteSql } = require('./bloggerStatus');
+    const params = [];
+    const base = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`, activeSiteSql('ns')];
+    if (STATUS_CODES[status]) { params.push(STATUS_CODES[status]); base.push(`ns.site_status = $${params.length}`); }
+    const where = base.join(' AND ');
+    const due = `st.checked_at < NOW() - INTERVAL '${RECHECK_MIN_DAYS} days'`;
+
+    const counts = (await query(
+        `SELECT COUNT(*) FILTER (WHERE st.site_id IS NULL) AS unchecked, COUNT(*) FILTER (WHERE ${due}) AS recheck_due
+         FROM new_sites ns LEFT JOIN site_traffic st ON st.site_id = ns.id WHERE ${where}`, params)).rows[0];
+
+    let sites = [];
+    if (type === 'unchecked' || type === 'recheck') {
+        const n = Math.min(25, Math.max(1, parseInt(limit, 10) || 10));
+        sites = (await query(
+            type === 'unchecked'
+                ? `SELECT ns.id, ns.root_domain FROM new_sites ns LEFT JOIN site_traffic st ON st.site_id = ns.id
+                   WHERE ${where} AND st.site_id IS NULL AND ns.root_domain IS NOT NULL ORDER BY ns.created_at DESC NULLS LAST, ns.id DESC LIMIT ${n}`
+                : `SELECT ns.id, ns.root_domain FROM new_sites ns JOIN site_traffic st ON st.site_id = ns.id
+                   WHERE ${where} AND ${due} AND ns.root_domain IS NOT NULL ORDER BY st.checked_at ASC, ns.id LIMIT ${n}`,
+            params)).rows;
+    }
+    return { sites, unchecked: Number(counts.unchecked), recheck_due: Number(counts.recheck_due), recheck_min_days: RECHECK_MIN_DAYS };
+};
+
 /** After a parser fix: rebuild every stored check from its raw capture */
 const reparseAll = async () => {
     await ensureSchema();
@@ -183,4 +223,4 @@ const reparseAll = async () => {
     return rows.length;
 };
 
-module.exports = { ensureSchema, parse, save, get, reparseAll };
+module.exports = { ensureSchema, parse, save, get, reparseAll, queue, RECHECK_MIN_DAYS };
