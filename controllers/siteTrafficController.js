@@ -89,4 +89,18 @@ const decideTrafficSuggestion = async (req, res, next) => {
     }
 };
 
-module.exports = { getSiteTraffic, saveSiteTraffic, getTrafficSuggestions, getTrafficSuggestionCounts, decideTrafficSuggestion };
+/**
+ * @route GET /api/admin/sites/traffic-queue?type=unchecked|recheck&status=Approved&limit=10  (also /api/manager/...)
+ * @desc  Next sites for "Check 10 unchecked" / "Re-check 10" across the whole list; without type only the counts.
+ *        Managers always get approved sites (their View All Sites list).
+ */
+const getTrafficQueue = async (req, res, next) => {
+    try {
+        const status = req.user.role?.toLowerCase() === 'manager' ? 'Approved' : String(req.query.status || '');
+        res.json(await siteTraffic.queue({ type: req.query.type, status, limit: req.query.limit }));
+    } catch (error) {
+        next(error);
+    }
+};
+
+module.exports = { getSiteTraffic, saveSiteTraffic, getTrafficSuggestions, getTrafficSuggestionCounts, decideTrafficSuggestion, getTrafficQueue };
