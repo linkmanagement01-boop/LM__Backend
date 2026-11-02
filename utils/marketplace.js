@@ -108,6 +108,27 @@ const ensureSchema = () => (schemaReady = schemaReady || (async () => {
     await query(`ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS paypal_capture_id VARCHAR(64)`);
     await query(`CREATE UNIQUE INDEX IF NOT EXISTS client_payments_paypal_order_uq ON client_payments (paypal_order_id) WHERE paypal_order_id IS NOT NULL`);
 
+    // Projects: a client's own website (abc.com) + up to 3 competitors; every order line belongs to one
+    await query(`
+        CREATE TABLE IF NOT EXISTS marketplace_projects (
+            id SERIAL PRIMARY KEY,
+            marketplace VARCHAR(30) NOT NULL,
+            client_user_id INT NOT NULL,
+            domain VARCHAR(255) NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`);
+    await query(`CREATE UNIQUE INDEX IF NOT EXISTS marketplace_projects_uq ON marketplace_projects (client_user_id, domain)`);
+    await query(`
+        CREATE TABLE IF NOT EXISTS marketplace_project_competitors (
+            id SERIAL PRIMARY KEY,
+            project_id INT NOT NULL REFERENCES marketplace_projects(id) ON DELETE CASCADE,
+            domain VARCHAR(255) NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (project_id, domain)
+        )`);
+    await query(`ALTER TABLE marketplace_cart_items ADD COLUMN IF NOT EXISTS project_id INT`);
+    await query(`ALTER TABLE client_order_details ADD COLUMN IF NOT EXISTS project_id INT`);
+
     // Two rule sets per marketplace: normal prices and FC prices (sites' fc_gp / fc_ne)
     await query(`ALTER TABLE marketplace_price_rules ADD COLUMN IF NOT EXISTS kind VARCHAR(10) NOT NULL DEFAULT 'normal'`);
     // FC orders: the cart line and the team's order remember that FC prices apply
@@ -203,6 +224,28 @@ const getBrand = (marketplace = DEFAULT_MARKETPLACE) => {
     };
 };
 
+/** Per-site status the client sees */
+const SITE_STATUS_SQL = `
+    CASE WHEN nopd.status = 8 THEN 'live'
+         WHEN nopd.status = 12 OR co.status = 'rejected' THEN 'cancelled'
+         WHEN nopd.status = 7 THEN 'publishing'
+         WHEN nopd.id IS NOT NULL THEN 'in_progress'
+         ELSE 'placed' END`;
+
+const orderItemsSql = `
+    SELECT cod.id, co.marketplace_order_id, co.order_type, cod.site_id, ns.root_domain, cod.anchor_text, cod.target_url,
+           cod.price, ${SITE_STATUS_SQL} AS status,
+           CASE WHEN nopd.status = 8 THEN nopd.submit_url END AS live_url
+    FROM client_orders co
+    JOIN client_order_details cod ON cod.client_order_id = co.id
+    LEFT JOIN new_sites ns ON ns.id = cod.site_id
+    LEFT JOIN LATERAL (
+        SELECT d.id, d.status, d.submit_url FROM new_order_processes p
+        JOIN new_order_process_details d ON d.new_order_process_id = p.id AND d.new_site_id = cod.site_id
+        WHERE p.new_order_id = co.linked_new_order_id
+        ORDER BY p.id DESC, d.id DESC LIMIT 1
+    ) nopd ON true`;
+
 module.exports = {
-    MARKETPLACES, DEFAULT_MARKETPLACE, RULE_KINDS, ensureSchema, getRules, priceColumns, applyRules, parsePrice, validateRules, priceSql, getBrand
+    SITE_STATUS_SQL, orderItemsSql, MARKETPLACES, DEFAULT_MARKETPLACE, RULE_KINDS, ensureSchema, getRules, priceColumns, applyRules, parsePrice, validateRules, priceSql, getBrand
 };

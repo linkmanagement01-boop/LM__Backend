@@ -2003,8 +2003,12 @@ const getWebsites = async (req, res, next) => {
                 ns.fc_gp, ns.fc_ne, ns.website_niche, ns.sample_url, ns.href_url,
                 ns.paypal_id, ns.skype, ns.whatsapp, ns.country_source,
                 ns.created_at, ns.updated_at,
-                (SELECT MAX(nopd.created_at) FROM new_order_process_details nopd WHERE nopd.new_site_id = ns.id) as lo_created_at
+                (SELECT MAX(nopd.created_at) FROM new_order_process_details nopd WHERE nopd.new_site_id = ns.id) as lo_created_at,
+                st.organic_traffic::float8 AS ahrefs_traffic, st.checked_at AS ahrefs_checked_at,
+                st.traffic_value::float8 AS ahrefs_value, st.history AS ahrefs_history, st.top_countries AS ahrefs_countries,
+                st.rule_action AS ahrefs_rule, st.rule_resolved AS ahrefs_rule_resolved, st.growth_pct::float8 AS growth_pct
              FROM new_sites ns
+             LEFT JOIN site_traffic st ON st.site_id = ns.id
              WHERE ${whereClause}
              ORDER BY ns.created_at DESC
              LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,

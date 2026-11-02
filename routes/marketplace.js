@@ -49,29 +49,47 @@ router.post('/:marketplace/auth/login', authLimiter, m.login);
 
 // Logged-in marketplace clients
 router.get('/:marketplace/me', m.requireClient, m.me);
-router.get('/:marketplace/sites', m.requireClient, m.getSites);
-router.get('/:marketplace/sites/categories', m.requireClient, m.getCategories);
-router.get('/:marketplace/sites/:id/posts', m.requireClient, m.getSitePosts);
-router.post('/:marketplace/uploads/content', m.requireClient, uploadOne, m.uploadContent);
+router.get('/:marketplace/plan', m.requireClient, m.getMyPlan);
+router.get('/:marketplace/sites', m.requireClient, m.requireActive, m.getSites);
+router.get('/:marketplace/sites/categories', m.requireClient, m.requireActive, m.getCategories);
+router.get('/:marketplace/sites/:id/posts', m.requireClient, m.requireActive, m.getSitePosts);
+router.post('/:marketplace/uploads/content', m.requireClient, m.requireActive, uploadOne, m.uploadContent);
 
-router.get('/:marketplace/cart', m.requireClient, m.getCart);
-router.post('/:marketplace/cart', m.requireClient, m.addToCart);
-router.put('/:marketplace/cart/:id', m.requireClient, m.updateCartItem);
-router.delete('/:marketplace/cart/:id', m.requireClient, m.removeCartItem);
-router.post('/:marketplace/checkout', m.requireClient, m.checkout);
+// Support chat with our team (staff replies show as "Support Team")
+const support = require('../controllers/supportController');
+const { supportUpload } = require('../utils/supportUpload');
+router.get('/:marketplace/support', m.requireClient, support.clientConversation);
+router.get('/:marketplace/support/unread', m.requireClient, support.clientUnread);
+router.post('/:marketplace/support/messages', m.requireClient, support.clientSend);
+router.post('/:marketplace/support/read', m.requireClient, support.clientRead);
+router.post('/:marketplace/support/upload', m.requireClient, supportUpload, support.uploadFile);
 
-router.get('/:marketplace/orders', m.requireClient, m.getOrders);
-router.get('/:marketplace/orders/:id', m.requireClient, m.getOrder);
+// Projects (client's own websites + competitors, purchase history per project)
+router.get('/:marketplace/projects', m.requireClient, m.requireActive, m.getProjects);
+router.post('/:marketplace/projects', m.requireClient, m.requireActive, m.createProject);
+router.get('/:marketplace/projects/:id', m.requireClient, m.requireActive, m.getProject);
+router.put('/:marketplace/projects/:id/competitors', m.requireClient, m.requireActive, m.updateCompetitors);
+router.post('/:marketplace/projects/:id/refresh', m.requireClient, m.requireActive, m.refreshProjectMetrics);
+router.delete('/:marketplace/projects/:id', m.requireClient, m.requireActive, m.deleteProject);
 
-router.get('/:marketplace/wallet', m.requireClient, m.getWallet);
-router.post('/:marketplace/wallet/paypal/create', m.requireClient, m.createPaypalTopup);
-router.post('/:marketplace/wallet/paypal/capture', m.requireClient, m.capturePaypalTopup);
+router.get('/:marketplace/cart', m.requireClient, m.requireActive, m.getCart);
+router.post('/:marketplace/cart', m.requireClient, m.requireActive, m.addToCart);
+router.put('/:marketplace/cart/:id', m.requireClient, m.requireActive, m.updateCartItem);
+router.delete('/:marketplace/cart/:id', m.requireClient, m.requireActive, m.removeCartItem);
+router.post('/:marketplace/checkout', m.requireClient, m.requireActive, m.checkout);
 
-router.get('/:marketplace/dashboard', m.requireClient, m.getDashboard);
-router.get('/:marketplace/transactions', m.requireClient, m.getTransactions);
-router.get('/:marketplace/profile', m.requireClient, m.getProfile);
-router.put('/:marketplace/profile', m.requireClient, m.updateProfile);
-router.put('/:marketplace/profile/password', authLimiter, m.requireClient, m.changePassword);
+router.get('/:marketplace/orders', m.requireClient, m.requireActive, m.getOrders);
+router.get('/:marketplace/orders/:id', m.requireClient, m.requireActive, m.getOrder);
+
+router.get('/:marketplace/wallet', m.requireClient, m.requireActive, m.getWallet);
+router.post('/:marketplace/wallet/paypal/create', m.requireClient, m.requireActive, m.createPaypalTopup);
+router.post('/:marketplace/wallet/paypal/capture', m.requireClient, m.capturePaypalTopup); // never lose an approved payment
+
+router.get('/:marketplace/dashboard', m.requireClient, m.requireActive, m.getDashboard);
+router.get('/:marketplace/transactions', m.requireClient, m.requireActive, m.getTransactions);
+router.get('/:marketplace/profile', m.requireClient, m.requireActive, m.getProfile);
+router.put('/:marketplace/profile', m.requireClient, m.requireActive, m.updateProfile);
+router.put('/:marketplace/profile/password', authLimiter, m.requireClient, m.requireActive, m.changePassword);
 
 router.get('/:marketplace/notifications', m.requireClient, m.getNotifications);
 router.post('/:marketplace/notifications/read', m.requireClient, m.markNotificationsRead);

@@ -19,6 +19,9 @@ const { sendEmail } = require('../utils/emailService');
 const { activeSiteSql, findInactiveBloggerSites } = require('../utils/bloggerStatus');
 const paypal = require('../utils/paypal');
 const mp = require('../utils/marketplace');
+const domainMetrics = require('../utils/domainMetrics');
+const plans = require('../utils/marketplacePlan');
+const { sendPlanEmail } = require('../utils/marketplacePlanEmails');
 
 const ORDER_TYPES = ['Guest Post', 'Niche Edit'];
 const TOPUP_MIN = 10;
@@ -64,14 +67,27 @@ const requireClient = async (req, res, next) => {
     }
 };
 
+/** Paused Pro account (no order for 12 months): only Support works until an admin reactivates it */
+const requireActive = async (req, res, next) => {
+    try {
+        if (await plans.isDeactivated(req.client.id)) {
+            return res.status(403).json({ error: 'Account Paused', code: 'account_deactivated', message: 'Your account is paused – please chat with support to reactivate it' });
+        }
+        next();
+    } catch (error) {
+        next(error);
+    }
+};
+
 // ─── Auth ─────────────────────────────────────────────────────────────
 
 /** @route POST /api/marketplace/:marketplace/auth/send-code  { name, email, password, confirm_password } */
 const sendSignupCode = async (req, res, next) => {
     try {
         const marketplace = marketplaceOf(req);
-        const { name, email, password, confirm_password } = req.body;
+        const { name, email, password, confirm_password, accept_terms } = req.body;
         if (!name || String(name).trim().length < 2) return bad(res, 'Please enter your name (at least 2 characters)');
+        if (accept_terms !== true) return bad(res, 'Please accept the Terms & Conditions to create your account');
         if (!password || String(password).length < 8) return bad(res, 'Password must be at least 8 characters');
         if (password !== confirm_password) return bad(res, 'Passwords do not match');
         const cleanEmail = String(email || '').trim().toLowerCase();
@@ -161,6 +177,7 @@ const verifySignupCode = async (req, res, next) => {
             )).rows[0];
             if (!created) return null;
             await client.query(`INSERT INTO wallets (user_id, balance, created_at, updated_at) VALUES ($1, 0, NOW(), NOW())`, [created.id]);
+            await plans.acceptTerms(client, created.id); // a code is only sent after the Terms were accepted
             await client.query(`DELETE FROM marketplace_pending_signups WHERE id = $1`, [pending.id]);
             return created;
         });
@@ -203,7 +220,8 @@ const me = async (req, res, next) => {
     try {
         const w = (await query(`SELECT COALESCE(balance, 0) AS balance FROM wallets WHERE user_id = $1 ORDER BY id DESC LIMIT 1`, [req.client.id])).rows[0];
         const cart = (await query(`SELECT COUNT(*) AS c FROM marketplace_cart_items WHERE client_user_id = $1`, [req.client.id])).rows[0];
-        res.json({ user: { id: req.client.id, name: req.client.name, email: req.client.email }, wallet_balance: Number(w?.balance || 0), cart_count: parseInt(cart.c) });
+        const plan = await plans.getPlan(req.client.id);
+        res.json({ user: { id: req.client.id, name: req.client.name, email: req.client.email }, wallet_balance: Number(w?.balance || 0), cart_count: parseInt(cart.c), plan });
     } catch (error) {
         next(error);
     }
@@ -265,6 +283,17 @@ const getSites = async (req, res, next) => {
         // cond builds the SQL from the placeholder (never search/replace inside SQL – price expressions contain '?')
         const add = (cond, value) => { params.push(value); where.push(cond(`$${params.length}`)); };
 
+        // Free plan: the free sites by default; with filters other sites show MASKED (name + sample never leave the server); page 1 only
+        const pro = await plans.isPro(req.client.id);
+        if (!pro && page > 1) {
+            return res.status(403).json({ error: 'Pro Required', code: 'pro_required', message: 'Unlock Pro to see more pages of sites' });
+        }
+        params.push(pro ? [] : await plans.freeDomains(marketplaceOf(req)));
+        const isFreeSql = `(${plans.domainKeySql('ns')} = ANY($${params.length}::text[]))`;
+        const filtered = ['category', 'min_price', 'max_price', 'min_dr', 'max_dr', 'min_da', 'max_da', 'min_traffic', 'max_traffic']
+            .some(k => q[k] !== undefined && q[k] !== '');
+        if (!pro && (!filtered || q.search)) where.push(isFreeSql); // default view + domain search: free sites only
+
         if (q.search) add(p => `ns.root_domain ILIKE ${p}`, `%${String(q.search).trim()}%`);
         // Category picked from the list (spellings that differ only in capitals count as one)
         if (q.category) add(p => `${categoryKeySql} = LOWER(TRIM(${p}))`, String(q.category));
@@ -291,23 +320,30 @@ const getSites = async (req, res, next) => {
         const orderBy = sorts[q.sort] || sorts.newest;
         const whereSql = where.join(' AND ');
 
-        const total = parseInt((await query(`SELECT COUNT(*) AS c FROM new_sites ns WHERE ${whereSql}`, params)).rows[0].c);
+        const counted = (await query(`SELECT COUNT(*) AS c, COUNT(*) FILTER (WHERE ${isFreeSql}) AS free_c FROM new_sites ns WHERE ${whereSql}`, params)).rows[0];
+        const total = parseInt(counted.c);
         const rows = (await query(
             `SELECT ns.id, ns.root_domain, COALESCE(NULLIF(ns.category, ''), ns.niche) AS category, ns.website_niche,
                     ns.da, ns.dr, ns.rd, ${trafficSql} AS traffic, ns.spam_score, ns.country_source AS country,
-                    ns.sample_url, ns.created_at,
+                    ns.sample_url, ns.created_at, ${isFreeSql} AS is_free,
                     ${gpPrice} AS gp_price, ${nePrice} AS niche_edit_price
              FROM new_sites ns
              WHERE ${whereSql}
-             ORDER BY ${orderBy}, ns.id DESC
+             ORDER BY ${pro ? '' : 'is_free DESC, '}${orderBy}, ns.id DESC
              LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
             [...params, limit, (page - 1) * limit]
-        )).rows.map(r => ({
-            ...r,
-            traffic: Number(r.traffic) || 0,
-            gp_price: r.gp_price === null ? null : Number(r.gp_price),
-            niche_edit_price: r.niche_edit_price === null ? null : Number(r.niche_edit_price)
-        }));
+        )).rows.map(r => {
+            const locked = !pro && !r.is_free;
+            return {
+                ...r,
+                root_domain: locked ? plans.maskDomain(r.root_domain) : r.root_domain,
+                sample_url: locked ? null : r.sample_url,
+                locked,
+                traffic: Number(r.traffic) || 0,
+                gp_price: r.gp_price === null ? null : Number(r.gp_price),
+                niche_edit_price: r.niche_edit_price === null ? null : Number(r.niche_edit_price)
+            };
+        });
         // Whole-marketplace numbers (ignoring the client's filters) for the banner – always the normal prices
         const nRules = fc ? await mp.getRules(marketplaceOf(req), 'normal') : rules;
         const nGp = fc ? mp.priceSql('ns.gp_price', nRules) : gpPrice;
@@ -326,6 +362,8 @@ const getSites = async (req, res, next) => {
              FROM new_sites ns WHERE ${siteListWhere} AND (${gpPrice} IS NOT NULL OR ${nePrice} IS NOT NULL)`
         )).rows[0] : stats;
         res.json({
+            plan: { tier: pro ? 'pro' : 'free' },
+            free_matches: pro ? null : parseInt(counted.free_c),
             sites: rows,
             pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
             fc,
@@ -335,6 +373,18 @@ const getSites = async (req, res, next) => {
     } catch (error) {
         next(error);
     }
+};
+
+/** Free plan: only the free sites can be ordered (returns the plan, or null when the site is allowed) */
+const PRO_REQUIRED = { error: 'Pro Required', code: 'pro_required', message: 'This site is part of Pro – unlock Pro to order it' };
+const lockedSiteIds = async (req, siteIds) => {
+    if (!siteIds.length || await plans.isPro(req.client.id)) return [];
+    const free = await plans.freeDomains(marketplaceOf(req));
+    const rows = (await query(
+        `SELECT ns.id FROM new_sites ns WHERE ns.id = ANY($1::int[]) AND NOT (${plans.domainKeySql('ns')} = ANY($2::text[]))`,
+        [siteIds.map(Number), free]
+    )).rows;
+    return rows.map(x => Number(x.id));
 };
 
 /** Current marketplace price of one site for a type (null = not for sale / not available) */
@@ -355,12 +405,13 @@ const cartContents = async (clientId, marketplace) => {
     const items = (await query(
         `SELECT c.id, c.site_id, c.order_type, c.anchor_text, c.target_url, c.created_at,
                 c.content_by, c.doc_url, c.doc_name, c.reference_url, c.title_suggestion, c.word_count, c.category AS brief_category,
-                c.keywords, c.target_country, c.note, c.post_url, c.post_title,
+                c.keywords, c.target_country, c.note, c.post_url, c.post_title, c.project_id, pr.domain AS project_domain,
                 c.fc, ns.root_domain, ns.gp_price AS b_gp, ns.niche_edit_price AS b_ne, ns.fc_gp AS b_fc_gp, ns.fc_ne AS b_fc_ne, ns.da, ns.dr, ns.rd,
                 COALESCE(NULLIF(ns.category, ''), ns.niche) AS category,
                 (ns.id IS NOT NULL AND ${siteListWhere.replace(/ns\./g, 'ns.')}) AS available
          FROM marketplace_cart_items c
          LEFT JOIN new_sites ns ON ns.id = c.site_id
+         LEFT JOIN marketplace_projects pr ON pr.id = c.project_id AND pr.client_user_id = c.client_user_id
          WHERE c.client_user_id = $1
          ORDER BY c.created_at ASC`,
         [clientId]
@@ -447,7 +498,15 @@ const cleanCartInput = (body, orderType, site) => {
     return { fields: f };
 };
 
-const CART_COLUMNS = ['anchor_text', 'target_url', ...DETAIL_FIELDS];
+const CART_COLUMNS = ['anchor_text', 'target_url', 'project_id', ...DETAIL_FIELDS];
+
+/** The client's own project (every cart line must belong to one) */
+const projectOf = async (req, projectId) => {
+    const id = parseInt(projectId, 10);
+    if (!id) return null;
+    return (await query(`SELECT id, domain FROM marketplace_projects WHERE id = $1 AND client_user_id = $2 AND marketplace = $3`,
+        [id, req.client.id, marketplaceOf(req)])).rows[0] || null;
+};
 
 /** @route POST /api/marketplace/:marketplace/cart  { site_id, order_type, anchor_text, target_url, ...content details } */
 const addToCart = async (req, res, next) => {
@@ -457,8 +516,12 @@ const addToCart = async (req, res, next) => {
         const { site, price } = await priceFor(parseInt(req.body.site_id), req.body.order_type, rules, fc);
         if (!site) return bad(res, 'This site is not available any more', 404);
         if (price === null) return bad(res, `${site.root_domain} doesn't offer ${fc ? 'FC ' : ''}${req.body.order_type}`);
+        if ((await lockedSiteIds(req, [site.id])).length) return res.status(403).json(PRO_REQUIRED);
+        const project = await projectOf(req, req.body.project_id);
+        if (!project) return bad(res, 'Please choose a project (or create one) for this order');
         const { error, fields } = cleanCartInput(req.body, req.body.order_type, site);
         if (error) return bad(res, error);
+        fields.project_id = project.id;
 
         const values = CART_COLUMNS.map(c => fields[c]);
         await query(
@@ -482,8 +545,12 @@ const updateCartItem = async (req, res, next) => {
              WHERE c.id = $1 AND c.client_user_id = $2`, [req.params.id, req.client.id]
         )).rows[0];
         if (!item) return bad(res, 'Cart item not found', 404);
+        if ((await lockedSiteIds(req, [item.site_id])).length) return res.status(403).json(PRO_REQUIRED);
+        const project = await projectOf(req, req.body.project_id ?? item.project_id);
+        if (!project) return bad(res, 'Please choose a project (or create one) for this order');
         const { error, fields } = cleanCartInput(req.body, item.order_type, item);
         if (error) return bad(res, error);
+        fields.project_id = project.id;
         await query(
             `UPDATE marketplace_cart_items SET ${CART_COLUMNS.map((c, i) => `${c} = $${i + 1}`).join(', ')}, updated_at = NOW()
              WHERE id = $${CART_COLUMNS.length + 1}`,
@@ -532,6 +599,7 @@ const getSitePosts = async (req, res, next) => {
     try {
         const site = (await query(`SELECT ns.id, ns.root_domain FROM new_sites ns WHERE ns.id = $1 AND ${siteListWhere}`, [req.params.id])).rows[0];
         if (!site) return bad(res, 'This site is not available any more', 404);
+        if ((await lockedSiteIds(req, [site.id])).length) return res.status(403).json(PRO_REQUIRED);
         const page = Math.max(1, parseInt(req.query.page) || 1);
         const limit = 20;
         const { status, indexing } = await ensurePostsIndexed(site);
@@ -596,9 +664,15 @@ const checkout = async (req, res, next) => {
         }
         const inactive = await findInactiveBloggerSites(items.map(i => i.site_id));
         if (inactive.length) return bad(res, `Please remove sites that are no longer available: ${inactive.join(', ')}`);
+        const locked = await lockedSiteIds(req, items.map(i => i.site_id));
+        if (locked.length) {
+            const names = items.filter(i => locked.includes(Number(i.site_id))).map(i => i.root_domain).join(', ');
+            return res.status(403).json({ ...PRO_REQUIRED, message: `Your cart has Pro sites (${names}) – unlock Pro or remove them to place the order` });
+        }
         for (const i of items) {
             const { error } = cleanCartInput({ ...i, category: i.brief_category }, i.order_type, i);
             if (error) return bad(res, `${i.root_domain} (${i.order_type}): ${error} – please edit it in your cart`);
+            if (!i.project_domain) return bad(res, `${i.root_domain} (${i.order_type}): choose a project – please edit it in your cart`);
         }
 
         const result = await transaction(async (client) => {
@@ -641,10 +715,10 @@ const checkout = async (req, res, next) => {
                         : i.reference_url ? { reference_url: i.reference_url } : null;
                     await client.query(
                         `INSERT INTO client_order_details (client_order_id, site_id, target_url, anchor_text, article_title, doc_url, post_url, note,
-                                                           fill_details, content_by, brief, price, created_at)
-                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())`,
+                                                           fill_details, content_by, brief, price, project_id, created_at)
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())`,
                         [co.id, i.site_id, i.target_url, i.anchor_text, i.title_suggestion || '', i.doc_url || '', i.post_url || '',
-                            i.note || '', i.fill, type === 'Guest Post' ? i.content_by : null, brief ? JSON.stringify(brief) : null, i.price]
+                            i.note || '', i.fill, type === 'Guest Post' ? i.content_by : null, brief ? JSON.stringify(brief) : null, i.price, i.project_id]
                     );
                 }
             }
@@ -677,27 +751,8 @@ const checkout = async (req, res, next) => {
 
 // ─── Orders ───────────────────────────────────────────────────────────
 
-/** Per-site status the client sees */
-const SITE_STATUS_SQL = `
-    CASE WHEN nopd.status = 8 THEN 'live'
-         WHEN nopd.status = 12 OR co.status = 'rejected' THEN 'cancelled'
-         WHEN nopd.status = 7 THEN 'publishing'
-         WHEN nopd.id IS NOT NULL THEN 'in_progress'
-         ELSE 'placed' END`;
-
-const orderItemsSql = `
-    SELECT cod.id, co.marketplace_order_id, co.order_type, cod.site_id, ns.root_domain, cod.anchor_text, cod.target_url,
-           cod.price, ${SITE_STATUS_SQL} AS status,
-           CASE WHEN nopd.status = 8 THEN nopd.submit_url END AS live_url
-    FROM client_orders co
-    JOIN client_order_details cod ON cod.client_order_id = co.id
-    LEFT JOIN new_sites ns ON ns.id = cod.site_id
-    LEFT JOIN LATERAL (
-        SELECT d.id, d.status, d.submit_url FROM new_order_processes p
-        JOIN new_order_process_details d ON d.new_order_process_id = p.id AND d.new_site_id = cod.site_id
-        WHERE p.new_order_id = co.linked_new_order_id
-        ORDER BY p.id DESC, d.id DESC LIMIT 1
-    ) nopd ON true`;
+/** Per-site status the client sees (shared SQL lives in utils/marketplace.js) */
+const { SITE_STATUS_SQL, orderItemsSql } = mp;
 
 const summarize = (items) => {
     const counts = { placed: 0, in_progress: 0, publishing: 0, live: 0, cancelled: 0 };
@@ -793,13 +848,15 @@ const getWallet = async (req, res, next) => {
         )).rows : [];
         const totals = w ? (await query(
             `SELECT COALESCE(SUM(CASE WHEN LOWER(type) = 'credit' AND remarks ILIKE '%top-up%' THEN price END), 0)::float AS added,
-                    COALESCE(SUM(CASE WHEN LOWER(type) = 'debit' THEN price END), 0)::float AS spent,
-                    COALESCE(SUM(CASE WHEN LOWER(type) = 'credit' AND remarks NOT ILIKE '%top-up%' THEN price END), 0)::float AS refunded
+                    COALESCE(SUM(CASE WHEN LOWER(type) = 'debit' AND remarks NOT LIKE '${plans.EXPIRED_REMARK}%' THEN price END), 0)::float AS spent,
+                    COALESCE(SUM(CASE WHEN LOWER(type) = 'credit' AND remarks NOT ILIKE '%top-up%' THEN price END), 0)::float AS refunded,
+                    COALESCE(SUM(CASE WHEN LOWER(type) = 'debit' AND remarks LIKE '${plans.EXPIRED_REMARK}%' THEN price END), 0)::float AS expired
              FROM wallet_histories WHERE wallet_id = $1`, [w.id]
-        )).rows[0] : { added: 0, spent: 0, refunded: 0 };
+        )).rows[0] : { added: 0, spent: 0, refunded: 0, expired: 0 };
         res.json({
             balance: Number(w?.balance || 0),
             totals,
+            funds: await plans.walletFunds(req.client.id),
             history,
             paypal: { configured: paypal.isConfigured(), client_id: paypal.isConfigured() ? paypal.clientId() : null, mode: paypal.mode(), currency: 'USD' },
             topup_limits: { min: TOPUP_MIN, max: TOPUP_MAX }
@@ -862,10 +919,17 @@ const capturePaypalTopup = async (req, res, next) => {
                  VALUES ($1,'Credit',$2,$3,1,NOW(),NOW(),NOW())`,
                 [wallet.id, payment.amount, `Wallet top-up via PayPal (${cap.captureId || paypalOrderId})`]
             );
-            return true;
+            // Same transaction: a $499+ top-up switches Pro on (once, for life)
+            return await plans.applyTopup(client, req.client.id, payment.amount);
         });
         const w = (await query(`SELECT COALESCE(balance, 0) AS balance FROM wallets WHERE user_id = $1 ORDER BY id DESC LIMIT 1`, [req.client.id])).rows[0];
-        res.json({ message: credited ? `$${Number(payment.amount).toFixed(2)} added to your wallet` : 'Payment already added to your wallet', wallet_balance: Number(w?.balance || 0) });
+        const plan = await plans.getPlan(req.client.id);
+        let message = credited ? `$${Number(payment.amount).toFixed(2)} added to your wallet` : 'Payment already added to your wallet';
+        if (credited?.became_pro) {
+            message += ' – you are now on Pro, for life';
+            sendPlanEmail(req, 'pro').catch(err => console.error('[Marketplace] Pro email failed:', err.message));
+        }
+        res.json({ message, wallet_balance: Number(w?.balance || 0), plan, became_pro: !!credited?.became_pro });
     } catch (error) {
         next(error);
     }
@@ -917,9 +981,10 @@ const getDashboard = async (req, res, next) => {
                    WHERE mo.client_user_id = $1 AND mo.marketplace = $2 ORDER BY cod.id DESC`, [req.client.id, marketplace]),
             w ? query(
                 `SELECT COALESCE(SUM(CASE WHEN LOWER(type) = 'credit' AND remarks ILIKE '%top-up%' THEN price END), 0)::float AS added,
-                        COALESCE(SUM(CASE WHEN LOWER(type) = 'debit' THEN price END), 0)::float AS spent,
-                        COALESCE(SUM(CASE WHEN LOWER(type) = 'credit' AND remarks NOT ILIKE '%top-up%' THEN price END), 0)::float AS refunded
-                 FROM wallet_histories WHERE wallet_id = $1`, [w.id]) : Promise.resolve({ rows: [{ added: 0, spent: 0, refunded: 0 }] }),
+                        COALESCE(SUM(CASE WHEN LOWER(type) = 'debit' AND remarks NOT LIKE '${plans.EXPIRED_REMARK}%' THEN price END), 0)::float AS spent,
+                        COALESCE(SUM(CASE WHEN LOWER(type) = 'credit' AND remarks NOT ILIKE '%top-up%' THEN price END), 0)::float AS refunded,
+                        COALESCE(SUM(CASE WHEN LOWER(type) = 'debit' AND remarks LIKE '${plans.EXPIRED_REMARK}%' THEN price END), 0)::float AS expired
+                 FROM wallet_histories WHERE wallet_id = $1`, [w.id]) : Promise.resolve({ rows: [{ added: 0, spent: 0, refunded: 0, expired: 0 }] }),
             query(`SELECT id, order_number, total_price::float AS total_price, created_at FROM marketplace_orders
                    WHERE client_user_id = $1 AND marketplace = $2 ORDER BY created_at DESC LIMIT 5`, [req.client.id, marketplace]),
             // Last 6 months: amount paid for orders + links ordered
@@ -1038,7 +1103,199 @@ const changePassword = async (req, res, next) => {
     }
 };
 
+// ─── Plan (Free / Pro) ────────────────────────────────────────────────
+
+/** @route GET /api/marketplace/:marketplace/plan – current plan, wallet money by expiry date and plan history */
+const getMyPlan = async (req, res, next) => {
+    try {
+        const plan = await plans.getPlan(req.client.id);
+        const history = (await query(
+            `SELECT kind, amount::float AS amount, note, created_at
+             FROM marketplace_plan_events WHERE client_user_id = $1 AND kind IN ('pro', 'grant', 'expired', 'deactivated', 'reactivated')
+             ORDER BY created_at DESC LIMIT 30`, [req.client.id]
+        )).rows;
+        const free = await plans.freeDomains(marketplaceOf(req));
+        res.json({ plan, history, free_sites: free.length });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// ─── Projects (the client's own websites + competitors) ───────────────
+
+const MAX_COMPETITORS = 3;
+const metricsView = (m) => (m ? {
+    authority: m.opr_score, global_rank: m.opr_rank, status: m.status, checked_at: m.fetched_at,
+    da: m.da ?? null, dr: m.dr ?? null, traffic: m.traffic ?? null
+} : null);
+
+/** Competitor list from the request: cleaned, deduplicated, not the project itself, max 3 */
+const cleanCompetitors = (list, ownDomain) => {
+    const out = [];
+    for (const raw of Array.isArray(list) ? list : []) {
+        if (!String(raw || '').trim()) continue;
+        const d = domainMetrics.normalizeDomain(raw);
+        if (!d) return { error: `"${String(raw).slice(0, 60)}" is not a valid domain (e.g. competitor.com)` };
+        if (d !== ownDomain && !out.includes(d)) out.push(d);
+    }
+    if (out.length > MAX_COMPETITORS) return { error: `You can add up to ${MAX_COMPETITORS} competitors` };
+    return { list: out };
+};
+
+const projectRow = async (req, id) => (await query(
+    `SELECT id, domain, created_at FROM marketplace_projects WHERE id = $1 AND client_user_id = $2 AND marketplace = $3`,
+    [id, req.client.id, marketplaceOf(req)]
+)).rows[0];
+
+/** @route GET /api/marketplace/:marketplace/projects – folders with order stats + cached metrics */
+const getProjects = async (req, res, next) => {
+    try {
+        await mp.ensureSchema();
+        const projects = (await query(
+            `SELECT p.id, p.domain, p.created_at,
+                    (SELECT COUNT(*)::int FROM marketplace_project_competitors c WHERE c.project_id = p.id) AS competitors,
+                    COUNT(cod.id)::int AS links,
+                    COUNT(DISTINCT co.marketplace_order_id)::int AS orders,
+                    COALESCE(SUM(cod.price), 0)::float AS spent,
+                    MAX(co.created_at) AS last_order_at
+             FROM marketplace_projects p
+             LEFT JOIN client_order_details cod ON cod.project_id = p.id
+             LEFT JOIN client_orders co ON co.id = cod.client_order_id AND co.client_user_id = p.client_user_id
+             WHERE p.client_user_id = $1 AND p.marketplace = $2
+             GROUP BY p.id ORDER BY p.created_at DESC`,
+            [req.client.id, marketplaceOf(req)]
+        )).rows;
+        // Live links per project (same status rules as My Orders)
+        const live = projects.length ? (await query(
+            `SELECT x.project_id, COUNT(*) FILTER (WHERE x.status = 'live')::int AS live
+             FROM (${orderItemsSql.replace('SELECT cod.id,', 'SELECT cod.project_id, cod.id,')} WHERE cod.project_id = ANY($1::int[])) x
+             GROUP BY x.project_id`, [projects.map(p => p.id)]
+        )).rows : [];
+        const liveBy = new Map(live.map(r => [r.project_id, r.live]));
+        const metrics = await domainMetrics.getMetrics(projects.map(p => p.domain));
+        res.json({
+            projects: projects.map(p => ({ ...p, live: liveBy.get(p.id) || 0, metrics: metricsView(metrics.get(p.domain)) })),
+            metrics_source: process.env.OPENPAGERANK_API_KEY ? 'openpagerank' : null
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/** @route POST /api/marketplace/:marketplace/projects  { domain, competitors?: [] } */
+const createProject = async (req, res, next) => {
+    try {
+        await mp.ensureSchema();
+        const domain = domainMetrics.normalizeDomain(req.body.domain);
+        if (!domain) return bad(res, 'Please enter your website domain, e.g. abc.com');
+        const comp = cleanCompetitors(req.body.competitors, domain);
+        if (comp.error) return bad(res, comp.error);
+        const existing = (await query(`SELECT id FROM marketplace_projects WHERE client_user_id = $1 AND domain = $2`, [req.client.id, domain])).rows[0];
+        if (existing) return res.status(200).json({ message: `${domain} is already one of your projects`, project: { id: existing.id, domain }, existing: true });
+        const project = await transaction(async (tx) => {
+            const p = (await tx.query(
+                `INSERT INTO marketplace_projects (marketplace, client_user_id, domain) VALUES ($1,$2,$3) RETURNING id, domain, created_at`,
+                [marketplaceOf(req), req.client.id, domain]
+            )).rows[0];
+            for (const c of comp.list) await tx.query(`INSERT INTO marketplace_project_competitors (project_id, domain) VALUES ($1,$2)`, [p.id, c]);
+            return p;
+        });
+        const metrics = await domainMetrics.getMetrics([domain, ...comp.list]);
+        res.status(201).json({ message: `Project ${domain} created`, project: { ...project, metrics: metricsView(metrics.get(domain)) } });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/** @route GET /api/marketplace/:marketplace/projects/:id – metrics, competitors and full purchase history */
+const getProject = async (req, res, next) => {
+    try {
+        const p = await projectRow(req, req.params.id);
+        if (!p) return bad(res, 'Project not found', 404);
+        const competitors = (await query(`SELECT id, domain FROM marketplace_project_competitors WHERE project_id = $1 ORDER BY id`, [p.id])).rows;
+        const metrics = await domainMetrics.getMetrics([p.domain, ...competitors.map(c => c.domain)]);
+        const items = (await query(
+            `${orderItemsSql}
+             JOIN marketplace_orders mo ON mo.id = co.marketplace_order_id
+             WHERE cod.project_id = $1 AND co.client_user_id = $2
+             ORDER BY mo.created_at DESC, cod.id`,
+            [p.id, req.client.id]
+        )).rows;
+        const orders = (await query(
+            `SELECT mo.id, mo.order_number, mo.created_at FROM marketplace_orders mo
+             WHERE mo.id = ANY($1::int[]) ORDER BY mo.created_at DESC`, [[...new Set(items.map(i => i.marketplace_order_id))]]
+        )).rows;
+        const byOrder = new Map(orders.map(o => [o.id, o]));
+        const history = items.map(i => ({ ...i, price: Number(i.price), order_number: byOrder.get(i.marketplace_order_id)?.order_number, ordered_at: byOrder.get(i.marketplace_order_id)?.created_at }));
+        const { counts } = summarize(history);
+        res.json({
+            project: { ...p, metrics: metricsView(metrics.get(p.domain)) },
+            competitors: competitors.map(c => ({ ...c, metrics: metricsView(metrics.get(c.domain)) })),
+            stats: {
+                orders: orders.length, links: history.length, live: counts.live,
+                in_progress: counts.placed + counts.in_progress + counts.publishing, cancelled: counts.cancelled,
+                spent: Math.round(history.filter(i => i.status !== 'cancelled').reduce((s, i) => s + i.price, 0) * 100) / 100,
+                guest_posts: history.filter(i => i.order_type === 'Guest Post').length,
+                niche_edits: history.filter(i => i.order_type === 'Niche Edit').length
+            },
+            history,
+            max_competitors: MAX_COMPETITORS
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/** @route PUT /api/marketplace/:marketplace/projects/:id/competitors  { competitors: [] } (replaces the list) */
+const updateCompetitors = async (req, res, next) => {
+    try {
+        const p = await projectRow(req, req.params.id);
+        if (!p) return bad(res, 'Project not found', 404);
+        const comp = cleanCompetitors(req.body.competitors, p.domain);
+        if (comp.error) return bad(res, comp.error);
+        await transaction(async (tx) => {
+            await tx.query(`DELETE FROM marketplace_project_competitors WHERE project_id = $1`, [p.id]);
+            for (const c of comp.list) await tx.query(`INSERT INTO marketplace_project_competitors (project_id, domain) VALUES ($1,$2)`, [p.id, c]);
+        });
+        await domainMetrics.getMetrics(comp.list);
+        res.json({ message: 'Competitors saved' });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/** @route POST /api/marketplace/:marketplace/projects/:id/refresh – re-check metrics (free source, at most once a day per domain) */
+const refreshProjectMetrics = async (req, res, next) => {
+    try {
+        const p = await projectRow(req, req.params.id);
+        if (!p) return bad(res, 'Project not found', 404);
+        const competitors = (await query(`SELECT domain FROM marketplace_project_competitors WHERE project_id = $1`, [p.id])).rows.map(c => c.domain);
+        await domainMetrics.getMetrics([p.domain, ...competitors], { force: true });
+        res.json({ message: 'Metrics updated' });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/** @route DELETE /api/marketplace/:marketplace/projects/:id – only projects without orders */
+const deleteProject = async (req, res, next) => {
+    try {
+        const p = await projectRow(req, req.params.id);
+        if (!p) return bad(res, 'Project not found', 404);
+        const used = (await query(`SELECT 1 FROM client_order_details WHERE project_id = $1 LIMIT 1`, [p.id])).rows.length;
+        if (used) return bad(res, 'This project has orders, so it is kept for your purchase history');
+        await query(`UPDATE marketplace_cart_items SET project_id = NULL WHERE project_id = $1 AND client_user_id = $2`, [p.id, req.client.id]);
+        await query(`DELETE FROM marketplace_projects WHERE id = $1`, [p.id]);
+        res.json({ message: `Project ${p.domain} deleted` });
+    } catch (error) {
+        next(error);
+    }
+};
+
 module.exports = {
+    requireActive,
+    getMyPlan,
+    getProjects, createProject, getProject, updateCompetitors, refreshProjectMetrics, deleteProject,
     getDashboard, getTransactions, getProfile, updateProfile, changePassword,
     uploadContent, getSitePosts, WRITING_FEES,
     checkMarketplace, requireClient,

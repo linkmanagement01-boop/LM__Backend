@@ -8,6 +8,7 @@ const marketplaceAdminController = require('../controllers/marketplaceAdminContr
 const adminSitesController = require('../controllers/adminSitesController');
 const managerController = require('../controllers/managerController');
 const adminReportController = require('../controllers/adminReportController');
+const siteTrafficController = require('../controllers/siteTrafficController');
 const { authenticate, authorize } = require('../middleware/auth');
 
 // Ensure profile upload directory exists
@@ -114,9 +115,23 @@ router.put('/sites/pending-bulk/:id/reject', adminController.rejectBulkRequest);
 
 // ==================== SITES LIST (View All Sites) ====================
 router.get('/sites/list', adminController.getWebsitesList);
+// Ahrefs traffic (saved by the LM Traffic Helper extension)
+router.get('/sites/:id/traffic', siteTrafficController.getSiteTraffic);
+router.post('/sites/:id/traffic', siteTrafficController.saveSiteTraffic);
+// Suggestions page (status rules after Ahrefs checks)
+router.get('/sites/traffic-suggestions', siteTrafficController.getTrafficSuggestions);
+router.get('/sites/traffic-suggestions/counts', siteTrafficController.getTrafficSuggestionCounts);
+router.post('/sites/:id/traffic-decision', siteTrafficController.decideTrafficSuggestion);
 // Marketplace pricing (editable price rules per marketplace)
 router.get('/marketplace/pricing', marketplaceAdminController.getPricing);
 router.put('/marketplace/pricing', marketplaceAdminController.updatePricing);
+// Marketplace clients: plans (Free / Pro) + the free sites list
+router.get('/marketplace/clients', marketplaceAdminController.getClients);
+router.get('/marketplace/clients/:id/plan', marketplaceAdminController.getClientPlan);
+router.post('/marketplace/clients/:id/grant-pro', marketplaceAdminController.grantClientPro);
+router.post('/marketplace/clients/:id/reactivate', marketplaceAdminController.reactivateClient);
+router.get('/marketplace/free-sites', marketplaceAdminController.getFreeSites);
+router.put('/marketplace/free-sites', marketplaceAdminController.updateFreeSites);
 router.get('/sites/deleted-list', adminController.getDeletedWebsitesList);
 router.put('/sites/:id/delete', adminController.deleteWebsite);
 router.put('/sites/:id/restore', adminController.restoreWebsite);
