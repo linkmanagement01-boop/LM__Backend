@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const managerController = require('../controllers/managerController');
 const adminSitesController = require('../controllers/adminSitesController');
+const siteTrafficController = require('../controllers/siteTrafficController');
 const { authenticate, authorize } = require('../middleware/auth');
 
 // Ensure profile upload directory exists
@@ -89,6 +90,13 @@ router.patch('/withdrawals/:id/reject', managerController.rejectWithdrawal);
 
 // ==================== WEBSITES/SITES MANAGEMENT ====================
 router.get('/websites', managerController.getWebsites);
+// Ahrefs traffic (saved by the LM Traffic Helper extension)
+router.get('/sites/:id/traffic', siteTrafficController.getSiteTraffic);
+router.post('/sites/:id/traffic', siteTrafficController.saveSiteTraffic);
+// Suggestions page (status rules after Ahrefs checks)
+router.get('/sites/traffic-suggestions', siteTrafficController.getTrafficSuggestions);
+router.get('/sites/traffic-suggestions/counts', siteTrafficController.getTrafficSuggestionCounts);
+router.post('/sites/:id/traffic-decision', siteTrafficController.decideTrafficSuggestion);
 
 // ==================== PROFILE MANAGEMENT ====================
 router.get('/profile', managerController.getProfile);

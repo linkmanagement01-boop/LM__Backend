@@ -73,4 +73,154 @@ const updatePricing = async (req, res, next) => {
     }
 };
 
-module.exports = { getPricing, updatePricing };
+// ─── Marketplace clients & plans ──────────────────────────────────────
+const plans = require('../utils/marketplacePlan');
+const planEmails = require('../utils/marketplacePlanEmails');
+
+/**
+ * @route GET /api/admin/marketplace/clients?marketplace&search&filter=pro|free|paused&page&limit
+ * Marketplace client accounts with their plan, wallet balance (and when it expires), last order and pause date.
+ */
+const getClients = async (req, res, next) => {
+    try {
+        await ensureSchema();
+        await plans.ensureSchema();
+        const marketplace = pickMarketplace(req.query.marketplace);
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 25));
+        const params = [marketplace];
+        let where = `u.role = 'client' AND u.marketplace = $1`;
+        if (String(req.query.search || '').trim()) {
+            params.push(`%${String(req.query.search).trim()}%`);
+            where += ` AND (u.name ILIKE $${params.length} OR u.email ILIKE $${params.length})`;
+        }
+        const filter = String(req.query.filter || '');
+        if (filter === 'pro') where += ' AND mp.pro_since IS NOT NULL';
+        if (filter === 'free') where += ' AND mp.pro_since IS NULL';
+        if (filter === 'paused') where += ' AND mp.deactivated_at IS NOT NULL';
+        const from = `FROM users u LEFT JOIN marketplace_plans mp ON mp.client_user_id = u.id WHERE ${where}`;
+        const total = parseInt((await query(`SELECT COUNT(*) AS c ${from}`, params)).rows[0].c);
+        const rows = (await query(
+            `SELECT u.id, u.name, u.email, u.status, u.created_at, u.last_login,
+                    COALESCE((SELECT w.balance FROM wallets w WHERE w.user_id = u.id ORDER BY w.id DESC LIMIT 1), 0)::float AS balance,
+                    COALESCE((SELECT SUM(cp.amount) FROM client_payments cp WHERE cp.client_user_id = u.id AND cp.status = 'completed'), 0)::float AS topups,
+                    (SELECT COUNT(*) FROM marketplace_orders mo WHERE mo.client_user_id = u.id)::int AS orders,
+                    mp.pro_since, mp.pro_source, mp.deactivated_at, (mp.pro_since IS NOT NULL) AS pro
+             ${from}
+             ORDER BY (mp.deactivated_at IS NOT NULL) DESC, (mp.pro_since IS NOT NULL) DESC, u.created_at DESC
+             LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+            [...params, limit, (page - 1) * limit]
+        )).rows;
+        // Next money expiry + last order + pause date (worked out per client from the wallet history)
+        const clients = await Promise.all(rows.map(async (c) => {
+            const plan = await plans.getPlan(c.id);
+            return { ...c, last_order_at: plan.last_order_at, deactivates_on: plan.deactivates_on, next_expiry: plan.funds.next_expiry };
+        }));
+        const stats = (await query(
+            `SELECT COUNT(*)::int AS clients,
+                    COUNT(*) FILTER (WHERE mp.pro_since IS NOT NULL)::int AS pro,
+                    COUNT(*) FILTER (WHERE mp.deactivated_at IS NOT NULL)::int AS paused
+             FROM users u LEFT JOIN marketplace_plans mp ON mp.client_user_id = u.id
+             WHERE u.role = 'client' AND u.marketplace = $1`, [marketplace]
+        )).rows[0];
+        res.json({ clients, stats, pro_price: plans.PRO_PRICE, pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } });
+    } catch (error) {
+        next(error);
+    }
+};
+
+const marketplaceClient = async (id) =>
+    (await query(`SELECT id, name, email FROM users WHERE id = $1 AND role = 'client' AND marketplace IS NOT NULL`, [id])).rows[0];
+
+/** @route GET /api/admin/marketplace/clients/:id/plan – plan, wallet money by expiry date and full plan history */
+const getClientPlan = async (req, res, next) => {
+    try {
+        const u = await marketplaceClient(req.params.id);
+        if (!u) return res.status(404).json({ error: 'Not Found', message: 'Marketplace client not found' });
+        const plan = await plans.getPlan(u.id);
+        const history = (await query(
+            `SELECT e.kind, e.amount::float AS amount, e.note, e.created_at, a.name AS by_name
+             FROM marketplace_plan_events e LEFT JOIN users a ON a.id = e.created_by
+             WHERE e.client_user_id = $1 AND e.kind IN ('pro', 'grant', 'expired', 'deactivated', 'reactivated')
+             ORDER BY e.created_at DESC LIMIT 100`, [u.id]
+        )).rows;
+        res.json({ client: u, plan, history });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/** @route POST /api/admin/marketplace/clients/:id/grant-pro  { note } – switch Pro on for life */
+const grantClientPro = async (req, res, next) => {
+    try {
+        const u = await marketplaceClient(req.params.id);
+        if (!u) return res.status(404).json({ error: 'Not Found', message: 'Marketplace client not found' });
+        const note = String(req.body.note || '').trim().slice(0, 300) || `Pro granted by ${req.user.email}`;
+        const granted = await transaction(tx => plans.grantPro(tx, u.id, note, req.user.id));
+        if (!granted) return res.status(400).json({ error: 'Validation Error', message: 'This client is already on Pro' });
+        planEmails.sendPlanEmailTo(u.id, 'pro').catch(() => {});
+        res.json({ message: `${u.name || u.email} is now on Pro`, plan: await plans.getPlan(u.id) });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/** @route POST /api/admin/marketplace/clients/:id/reactivate  { note } – full access again, 12-month clock restarts */
+const reactivateClient = async (req, res, next) => {
+    try {
+        const u = await marketplaceClient(req.params.id);
+        if (!u) return res.status(404).json({ error: 'Not Found', message: 'Marketplace client not found' });
+        const note = String(req.body.note || '').trim().slice(0, 300) || `Reactivated by ${req.user.email}`;
+        const done = await transaction(tx => plans.reactivate(tx, u.id, note, req.user.id));
+        if (!done) return res.status(400).json({ error: 'Validation Error', message: 'This account is not paused' });
+        planEmails.sendPlanEmailTo(u.id, 'reactivated').catch(() => {});
+        res.json({ message: `${u.name || u.email} is active again`, plan: await plans.getPlan(u.id) });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/** @route GET /api/admin/marketplace/free-sites?marketplace – the sites Free users can see and order */
+const getFreeSites = async (req, res, next) => {
+    try {
+        const marketplace = pickMarketplace(req.query.marketplace);
+        const domains = await plans.freeDomains(marketplace);
+        const found = (await query(
+            `SELECT ${plans.domainKeySql('ns')} AS d, BOOL_OR((ns.delete_site IS NULL OR ns.delete_site = 0) AND ns.site_status = '1') AS listed,
+                    MAX(ns.dr) AS dr
+             FROM new_sites ns WHERE ${plans.domainKeySql('ns')} = ANY($1::text[]) GROUP BY 1`, [domains]
+        )).rows;
+        const by = new Map(found.map(f => [f.d, f]));
+        res.json({
+            marketplace,
+            sites: domains.map(d => ({ domain: d, in_sites: by.has(d), listed: !!by.get(d)?.listed, dr: by.get(d)?.dr ?? null }))
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/** @route PUT /api/admin/marketplace/free-sites  { marketplace, domains: [] } – replace the free list */
+const updateFreeSites = async (req, res, next) => {
+    try {
+        await plans.ensureSchema();
+        const marketplace = pickMarketplace(req.body.marketplace);
+        const list = [...new Set((Array.isArray(req.body.domains) ? req.body.domains : []).map(plans.keyOf).filter(Boolean))];
+        if (!list.length) return res.status(400).json({ error: 'Validation Error', message: 'Add at least one free site' });
+        if (list.length > 100) return res.status(400).json({ error: 'Validation Error', message: 'Keep the free list to 100 sites or fewer' });
+        const invalid = list.filter(d => !/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(d));
+        if (invalid.length) return res.status(400).json({ error: 'Validation Error', message: `Not a domain: ${invalid.join(', ')}` });
+        await transaction(async (tx) => {
+            await tx.query(`DELETE FROM marketplace_free_sites WHERE marketplace = $1`, [marketplace]);
+            for (const [i, d] of list.entries()) {
+                await tx.query(`INSERT INTO marketplace_free_sites (marketplace, domain, position) VALUES ($1,$2,$3)`, [marketplace, d, i]);
+            }
+        });
+        req.query.marketplace = marketplace;
+        return getFreeSites(req, res, next);
+    } catch (error) {
+        next(error);
+    }
+};
+
+module.exports = { getPricing, updatePricing, getClients, getClientPlan, grantClientPro, reactivateClient, getFreeSites, updateFreeSites };

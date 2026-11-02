@@ -25,6 +25,7 @@ const threadRoutes = require('./routes/threads');
 const chatRoutes = require('./routes/chat');
 const clientRoutes = require('./routes/client');
 const marketplaceRoutes = require('./routes/marketplace');
+const supportRoutes = require('./routes/support');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -68,7 +69,9 @@ const isOriginAllowed = (origin) => {
   if (allowedOrigins.includes(origin)) return true;
   if (origin.endsWith('.trycloudflare.com')) return true;
   if (origin.endsWith('.femur.studio')) return true;
-  
+  // LM Traffic Helper (Chrome extension) saves Ahrefs traffic – it still needs a valid login token
+  if (origin.startsWith('chrome-extension://')) return true;
+
   // Allow local network IPs for testing from other PCs
   if (origin.match(/^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/)) return true;
   
@@ -92,6 +95,9 @@ const io = new Server(server, {
 
 // Make io accessible to routes/controllers
 app.set('io', io);
+
+// Marketplace support chat: rooms are joined only with a valid login token ('support:join')
+require('./utils/supportChat').attachSockets(io);
 
 // Socket.io connection handling
 io.on('connection', (socket) => {
@@ -228,6 +234,7 @@ app.use('/api/accountant', accountantRoutes);
 app.use('/api/config', configRoutes);
 app.use('/api/threads', threadRoutes);
 app.use('/api/chat', chatRoutes);
+app.use('/api/support', supportRoutes); // marketplace support chat – staff inbox
 app.use('/api/client', clientRoutes);
 // Marketplace storefront API (white-label, later India / International) – only when switched on
 if (process.env.MARKETPLACE_ENABLED === 'true') {
@@ -254,8 +261,15 @@ server.listen(PORT, '0.0.0.0', () => {
 
   // Marketplace tables/columns are created even while the storefront is off – dashboard pages read some of them
   require('./utils/marketplace').ensureSchema()
+    .then(() => require('./utils/marketplacePlan').ensureSchema())
+    .then(() => require('./utils/supportChat').ensureSchema())
     .then(() => console.log(`🛒 Marketplace storefront API: ${process.env.MARKETPLACE_ENABLED === 'true' ? 'ON' : 'OFF'}`))
     .catch(err => console.error('Marketplace schema setup failed:', err.message));
+  // Pro plan emails (3 days left / ended) – only while the storefront is on
+  if (process.env.MARKETPLACE_ENABLED === 'true') require('./utils/marketplacePlanEmails').startPlanReminders();
+
+  // Ahrefs traffic checks (View All Sites → Check traffic)
+  require('./utils/siteTraffic').ensureSchema().catch(err => console.error('Site traffic schema setup failed:', err.message));
 
   // Daily job: save each active site's blog posts (from its sitemap) for the team's keyword search
   require('./jobs/postIndexer').startPostIndexer();
