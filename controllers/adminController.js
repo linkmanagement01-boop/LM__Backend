@@ -11,6 +11,8 @@ const logger = require('../utils/logger');
 const PDFDocument = require('pdfkit');
 const jwt = require('jsonwebtoken');
 const { sendPaymentApprovedEmail } = require('../utils/emailService');
+const { applySiteFilters, siteCategories, statusCode } = require('../utils/siteListFilters');
+const faqs = require('../utils/faqs');
 const { activeSiteSql, activeBloggerSql, getDeactivationBlockers, canDeleteBloggerSql, getDeletionBlockers, deleteBloggerData } = require('../utils/bloggerStatus');
 
 // Configure multer for file uploads
@@ -507,6 +509,63 @@ const getStatistics = async (req, res, next) => {
         };
 
         res.json({ statistics, ...stats });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   GET /api/admin/dashboard/overview?year=2026
+ * @desc    Real numbers for the admin dashboard: sites, live links, orders, link pipeline,
+ *          and month-by-month live links / spend on live links / bloggers joined for one year
+ * @access  Admin only
+ * Link (order detail) status: 5 with blogger, 7 waiting for approval, 8 live, 11 sent back for revision, 12 refused
+ */
+const getDashboardOverview = async (req, res, next) => {
+    try {
+        const thisYear = new Date().getFullYear();
+        const year = parseInt(req.query.year) || thisYear;
+        const siteWhere = `(ns.delete_site IS NULL OR ns.delete_site = 0) AND ${activeSiteSql('ns')}`;
+
+        const [kpi, orders, pipeline, links, bloggers, first] = await Promise.all([
+            query(`SELECT COUNT(*) FILTER (WHERE ns.site_status = '1')::int AS approved_sites,
+                          COUNT(*) FILTER (WHERE ns.site_status = '0' OR ns.site_status IS NULL)::int AS pending_sites
+                   FROM new_sites ns WHERE ${siteWhere}`),
+            query(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE new_order_status = 5)::int AS completed,
+                          COUNT(*) FILTER (WHERE created_at >= date_trunc('month', NOW()))::int AS this_month
+                   FROM new_orders`),
+            query(`SELECT COUNT(*) FILTER (WHERE status IN (2, 3, 5))::int AS with_blogger,
+                          COUNT(*) FILTER (WHERE status = 7)::int AS waiting_approval,
+                          COUNT(*) FILTER (WHERE status = 11)::int AS revision,
+                          COUNT(*) FILTER (WHERE status = 8)::int AS live,
+                          COUNT(*) FILTER (WHERE status = 12)::int AS refused,
+                          COUNT(*) FILTER (WHERE status = 8 AND updated_at >= date_trunc('month', NOW()))::int AS live_this_month,
+                          COUNT(*) FILTER (WHERE status = 8 AND updated_at >= date_trunc('month', NOW()) - INTERVAL '1 month'
+                                                         AND updated_at < date_trunc('month', NOW()))::int AS live_last_month
+                   FROM new_order_process_details`),
+            query(`SELECT EXTRACT(MONTH FROM updated_at)::int AS m, COUNT(*)::int AS live, COALESCE(SUM(price), 0)::float8 AS spend
+                   FROM new_order_process_details
+                   WHERE status = 8 AND updated_at >= make_date($1, 1, 1) AND updated_at < make_date($1 + 1, 1, 1)
+                   GROUP BY 1`, [year]),
+            query(`SELECT EXTRACT(MONTH FROM created_at)::int AS m, COUNT(*)::int AS joined
+                   FROM users WHERE LOWER(role) = 'vendor' AND created_at >= make_date($1, 1, 1) AND created_at < make_date($1 + 1, 1, 1)
+                   GROUP BY 1`, [year]),
+            query(`SELECT EXTRACT(YEAR FROM MIN(created_at))::int AS y FROM new_order_process_details`)
+        ]);
+
+        const months = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, live: 0, spend: 0, joined: 0 }));
+        links.rows.forEach(r => { months[r.m - 1].live = r.live; months[r.m - 1].spend = Math.round(r.spend); });
+        bloggers.rows.forEach(r => { months[r.m - 1].joined = r.joined; });
+        const firstYear = Math.min(first.rows[0]?.y || thisYear, thisYear);
+
+        res.json({
+            sites: kpi.rows[0],
+            orders: orders.rows[0],
+            pipeline: pipeline.rows[0],
+            year,
+            years: Array.from({ length: thisYear - firstYear + 1 }, (_, i) => thisYear - i),
+            months
+        });
     } catch (error) {
         next(error);
     }
@@ -2176,6 +2235,10 @@ const getWebsitesList = async (req, res, next) => {
         addRangeFilter('gp_price', 'ns.gp_price');
         addRangeFilter('niche_price', 'ns.niche_edit_price');
 
+        // Marketplace-style filters (FC, GP/NE, min–max, category, sort)
+        const orderBy = applySiteFilters(req.query, conditions, queryParams);
+        paramIndex = queryParams.length + 1;
+
         const whereClause = conditions.join(' AND ');
 
         // Execute Count query (same filters, no pagination)
@@ -2203,7 +2266,7 @@ const getWebsitesList = async (req, res, next) => {
              FROM new_sites ns
              LEFT JOIN site_traffic st ON st.site_id = ns.id
              WHERE ${whereClause}
-             ORDER BY ns.created_at DESC
+             ORDER BY ${orderBy}
              LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
             dataParams
         );
@@ -2212,6 +2275,22 @@ const getWebsitesList = async (req, res, next) => {
             sites: result.rows,
             pagination: { page, limit, total, totalPages }
         });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   GET /api/admin/sites/categories?fc=1&filter_website_status=Approved
+ * @desc    Categories (with counts) for the Sites filter
+ * @access  Admin only
+ */
+const getSiteCategories = async (req, res, next) => {
+    try {
+        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`, activeSiteSql('ns')];
+        const params = [];
+        if (req.query.filter_website_status) { params.push(statusCode(req.query.filter_website_status)); conditions.push(`ns.site_status = $1`); }
+        res.json({ categories: await siteCategories(req.query, conditions, params) });
     } catch (error) {
         next(error);
     }
@@ -2585,51 +2664,26 @@ const deleteCareer = async (req, res, next) => {
 };
 
 // ==================== FAQs Management ====================
+// Shown on the public FAQ page (/faq) in three tabs: advertiser, publisher, content_writing
+
+const faqBody = (body) => ({
+    question: String(body.question || '').trim(),
+    answer: body.answer || '',
+    is_active: body.is_active,
+    category: body.category,
+    sort_order: body.sort_order
+});
 
 /**
  * @route   GET /api/admin/faqs
- * @desc    Get all FAQs
+ * @desc    Get all FAQs (every tab, active or not)
  * @access  Admin only
  */
 const getFaqs = async (req, res, next) => {
     try {
-        const result = await query(
-            `SELECT id, question, answer, COALESCE(active, true) as is_active, created_at, updated_at
-             FROM faqs
-             ORDER BY created_at DESC`
-        );
-        res.json({ faqs: result.rows });
+        res.json({ faqs: await faqs.list() });
     } catch (error) {
-        // Table doesn't exist
-        if (error.code === '42P01') {
-            await query(`
-                CREATE TABLE IF NOT EXISTS faqs (
-                    id SERIAL PRIMARY KEY,
-                    question TEXT NOT NULL,
-                    answer TEXT,
-                    active BOOLEAN DEFAULT true,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            `);
-            res.json({ faqs: [] });
-        }
-        // Column doesn't exist - add it
-        else if (error.code === '42703') {
-            try {
-                await query(`ALTER TABLE faqs ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT true`);
-                // Retry the query
-                const result = await query(
-                    `SELECT id, question, answer, COALESCE(active, true) as is_active, created_at, updated_at
-                     FROM faqs ORDER BY created_at DESC`
-                );
-                res.json({ faqs: result.rows });
-            } catch (alterError) {
-                next(alterError);
-            }
-        } else {
-            next(error);
-        }
+        next(error);
     }
 };
 
@@ -2640,34 +2694,9 @@ const getFaqs = async (req, res, next) => {
  */
 const createFaq = async (req, res, next) => {
     try {
-        const { question, answer, is_active = true } = req.body;
-
-        if (!question) {
-            return res.status(400).json({ message: 'Question is required' });
-        }
-
-        await query(`
-            CREATE TABLE IF NOT EXISTS faqs (
-                id SERIAL PRIMARY KEY,
-                question TEXT NOT NULL,
-                answer TEXT,
-                active BOOLEAN DEFAULT true,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-
-        const result = await query(
-            `INSERT INTO faqs (question, answer, active)
-             VALUES ($1, $2, $3)
-             RETURNING *`,
-            [question, answer, is_active]
-        );
-
-        res.status(201).json({
-            message: 'FAQ created successfully',
-            faq: result.rows[0]
-        });
+        const body = faqBody(req.body);
+        if (!body.question) return res.status(400).json({ message: 'Question is required' });
+        res.status(201).json({ message: 'FAQ created successfully', faq: await faqs.create(body) });
     } catch (error) {
         next(error);
     }
@@ -2680,16 +2709,9 @@ const createFaq = async (req, res, next) => {
  */
 const getFaqById = async (req, res, next) => {
     try {
-        const { id } = req.params;
-        const result = await query(
-            `SELECT id, question, answer, active as is_active, created_at, updated_at
-             FROM faqs WHERE id = $1`,
-            [id]
-        );
-        if (result.rows.length === 0) {
-            return res.status(404).json({ message: 'FAQ not found' });
-        }
-        res.json({ faq: result.rows[0] });
+        const faq = await faqs.get(req.params.id);
+        if (!faq) return res.status(404).json({ message: 'FAQ not found' });
+        res.json({ faq });
     } catch (error) {
         next(error);
     }
@@ -2702,29 +2724,11 @@ const getFaqById = async (req, res, next) => {
  */
 const updateFaq = async (req, res, next) => {
     try {
-        const { id } = req.params;
-        const { question, answer, is_active } = req.body;
-
-        if (!question) {
-            return res.status(400).json({ message: 'Question is required' });
-        }
-
-        const result = await query(
-            `UPDATE faqs 
-             SET question = $1, answer = $2, active = $3, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $4
-             RETURNING *`,
-            [question, answer, is_active, id]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({ message: 'FAQ not found' });
-        }
-
-        res.json({
-            message: 'FAQ updated successfully',
-            faq: result.rows[0]
-        });
+        const body = faqBody(req.body);
+        if (!body.question) return res.status(400).json({ message: 'Question is required' });
+        const faq = await faqs.update(req.params.id, body);
+        if (!faq) return res.status(404).json({ message: 'FAQ not found' });
+        res.json({ message: 'FAQ updated successfully', faq });
     } catch (error) {
         next(error);
     }
@@ -2737,15 +2741,7 @@ const updateFaq = async (req, res, next) => {
  */
 const deleteFaq = async (req, res, next) => {
     try {
-        const { id } = req.params;
-        const result = await query(
-            `DELETE FROM faqs WHERE id = $1 RETURNING id`,
-            [id]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({ message: 'FAQ not found' });
-        }
+        if (!(await faqs.remove(req.params.id))) return res.status(404).json({ message: 'FAQ not found' });
         res.json({ message: 'FAQ deleted successfully' });
     } catch (error) {
         next(error);
@@ -4203,6 +4199,7 @@ module.exports = {
     updateWebsite,
     // deleteWebsite, // The original deleteWebsite is likely a hard delete, replacing with soft delete
     getStatistics,
+    getDashboardOverview,
     getAllTasks,
     getAllWithdrawals,
     getAllPriceCharts,
@@ -4225,6 +4222,7 @@ module.exports = {
     getSitesForAccountCreation,
     createAccountsFromSites,
     getWebsitesList,
+    getSiteCategories,
     getDeletedWebsitesList,
     deleteWebsite, // This is now the soft delete
     restoreWebsite,

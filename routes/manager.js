@@ -90,6 +90,7 @@ router.patch('/withdrawals/:id/reject', managerController.rejectWithdrawal);
 
 // ==================== WEBSITES/SITES MANAGEMENT ====================
 router.get('/websites', managerController.getWebsites);
+router.get('/websites/categories', managerController.getSiteCategories);
 // Ahrefs traffic (saved by the LM Traffic Helper extension)
 router.get('/sites/:id/traffic', siteTrafficController.getSiteTraffic);
 router.post('/sites/:id/traffic', siteTrafficController.saveSiteTraffic);

@@ -5,6 +5,7 @@ const { addCreditToBloggerWallet, processWithdrawalApproval } = require('../util
 const { query, transaction } = require('../config/database');
 const logger = require('../utils/logger');
 const { notifyLinkLive, notifyRefund } = require('../utils/marketplaceNotify');
+const { applySiteFilters, siteCategories, statusCode } = require('../utils/siteListFilters');
 const { activeSiteSql, activeBloggerSql, findInactiveBloggerSites, inactiveSitesMessage } = require('../utils/bloggerStatus');
 const { sendOrderAssignedEmail } = require('../utils/emailService');
 
@@ -1983,6 +1984,10 @@ const getWebsites = async (req, res, next) => {
         addRangeFilter('gp_price', 'ns.gp_price');
         addRangeFilter('niche_price', 'ns.niche_edit_price');
 
+        // Marketplace-style filters (FC, GP/NE, min–max, category, sort)
+        const orderBy = applySiteFilters(req.query, conditions, queryParams);
+        paramIndex = queryParams.length + 1;
+
         const whereClause = conditions.join(' AND ');
 
         // Execute Count query (same filters, no pagination)
@@ -2010,7 +2015,7 @@ const getWebsites = async (req, res, next) => {
              FROM new_sites ns
              LEFT JOIN site_traffic st ON st.site_id = ns.id
              WHERE ${whereClause}
-             ORDER BY ns.created_at DESC
+             ORDER BY ${orderBy}
              LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
             dataParams
         );
@@ -2019,6 +2024,20 @@ const getWebsites = async (req, res, next) => {
             sites: result.rows,
             pagination: { page, limit, total, totalPages }
         });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route   GET /api/manager/websites/categories?fc=1&filter_website_status=
+ * @desc    Categories (with counts) for the Sites filter – approved sites unless a status is picked
+ * @access  Manager only
+ */
+const getSiteCategories = async (req, res, next) => {
+    try {
+        const conditions = [`(ns.delete_site IS NULL OR ns.delete_site = 0)`, activeSiteSql('ns'), `ns.site_status = $1`];
+        res.json({ categories: await siteCategories(req.query, conditions, [statusCode(req.query.filter_website_status || 'Approved')]) });
     } catch (error) {
         next(error);
     }
@@ -3689,6 +3708,7 @@ module.exports = {
     getWriters,
     getBloggers,
     getWebsites,
+    getSiteCategories,
     pushToBloggers,
     getBloggerSubmissionDetail,
     finalizeFromBlogger,

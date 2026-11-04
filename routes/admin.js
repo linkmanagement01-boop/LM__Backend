@@ -88,6 +88,7 @@ router.post('/sites/upload-excel-confirm', adminController.confirmSitesExcel);
 
 // ==================== STATISTICS ====================
 router.get('/stats', adminController.getStatistics);
+router.get('/dashboard/overview', adminController.getDashboardOverview);
 
 // ==================== TASKS (Read-only for admin overview) ====================
 router.get('/tasks', adminController.getAllTasks);
@@ -115,6 +116,7 @@ router.put('/sites/pending-bulk/:id/reject', adminController.rejectBulkRequest);
 
 // ==================== SITES LIST (View All Sites) ====================
 router.get('/sites/list', adminController.getWebsitesList);
+router.get('/sites/categories', adminController.getSiteCategories);
 // Ahrefs traffic (saved by the LM Traffic Helper extension)
 router.get('/sites/:id/traffic', siteTrafficController.getSiteTraffic);
 router.post('/sites/:id/traffic', siteTrafficController.saveSiteTraffic);

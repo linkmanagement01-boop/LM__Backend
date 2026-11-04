@@ -37,13 +37,60 @@ const ensureSchema = () => (schemaReady = schemaReady || (async () => {
         CREATE TABLE IF NOT EXISTS site_traffic_log (
             id SERIAL PRIMARY KEY,
             site_id BIGINT NOT NULL,
-            action VARCHAR(20) NOT NULL,          -- auto_rejected | suggested | activated | kept | undone | confirmed
+            action VARCHAR(20) NOT NULL,          -- auto_rejected | suggested | activated | kept | undone | confirmed | traffic_set
             organic_traffic BIGINT,
             growth_pct NUMERIC(10,2),
             user_id INT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )`);
+    // traffic_set rows: the site's Traffic before the Ahrefs number replaced it
+    await query(`ALTER TABLE site_traffic_log ADD COLUMN IF NOT EXISTS previous_traffic DOUBLE PRECISION`);
+    await query(`ALTER TABLE site_traffic_log ADD COLUMN IF NOT EXISTS previous_traffic_source TEXT`);
+    await syncTrafficOnce();
 })().catch(err => { schemaReady = null; throw err; }));
+
+/*
+ * A site's traffic is kept in two columns: new_sites.traffic (number) and new_sites.traffic_source (text).
+ * The site lists, team search and marketplace show traffic_source when it is a number (Excel imports);
+ * sites added by bloggers have a country there instead ("Traffic source (Country)"), which is left as it is.
+ */
+const SOURCE_IS_NUMBER = (col) => `(${col} IS NULL OR btrim(${col}) = '' OR btrim(${col}) ~ '^[0-9]+(\\.[0-9]+)?$')`;
+
+/**
+ * One-time: sites checked before "Ahrefs replaces Traffic" existed get their last Ahrefs number now,
+ * so they don't need a re-check. Runs once (marker in site_traffic_jobs); later manual edits are left alone.
+ */
+const SYNC_JOB = 'sync_traffic_from_checks_v2';
+const syncTrafficOnce = async () => {
+    await query(`CREATE TABLE IF NOT EXISTS site_traffic_jobs (name VARCHAR(60) PRIMARY KEY, done_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), info TEXT)`);
+    const claimed = await query(`INSERT INTO site_traffic_jobs (name) VALUES ($1) ON CONFLICT DO NOTHING RETURNING name`, [SYNC_JOB]);
+    if (!claimed.rows.length) return; // already done
+    let r;
+    try {
+        r = await query(`
+            WITH changed AS (
+                SELECT ns.id, ns.traffic AS previous, ns.traffic_source AS previous_source, t.organic_traffic, t.checked_by,
+                       ${SOURCE_IS_NUMBER('ns.traffic_source')} AS source_is_number
+                FROM site_traffic t JOIN new_sites ns ON ns.id = t.site_id
+                WHERE t.organic_traffic IS NOT NULL
+                  AND (ns.traffic IS DISTINCT FROM t.organic_traffic::float8
+                       OR (${SOURCE_IS_NUMBER('ns.traffic_source')} AND ns.traffic_source IS DISTINCT FROM t.organic_traffic::text))
+            ), upd AS (
+                UPDATE new_sites ns SET traffic = c.organic_traffic,
+                    traffic_source = CASE WHEN c.source_is_number THEN c.organic_traffic::text ELSE ns.traffic_source END,
+                    updated_at = NOW()
+                FROM changed c WHERE ns.id = c.id RETURNING ns.id
+            )
+            INSERT INTO site_traffic_log (site_id, action, organic_traffic, previous_traffic, previous_traffic_source, user_id)
+            SELECT c.id, 'traffic_set', c.organic_traffic, c.previous, c.previous_source, c.checked_by FROM changed c JOIN upd ON upd.id = c.id
+            RETURNING site_id`);
+    } catch (err) {
+        await query(`DELETE FROM site_traffic_jobs WHERE name = $1`, [SYNC_JOB]); // retry on next start
+        throw err;
+    }
+    await query(`UPDATE site_traffic_jobs SET info = $2 WHERE name = $1`, [SYNC_JOB, `${r.rows.length} sites updated`]);
+    console.log(`📈 Traffic synced from existing Ahrefs checks: ${r.rows.length} sites`);
+};
 
 // ─── Parsing ──────────────────────────────────────────────────────────
 
@@ -159,7 +206,27 @@ const save = async (siteId, domain, raw, userId) => {
          RETURNING site_id, domain, organic_traffic::float8 AS organic_traffic, traffic_value::float8 AS traffic_value, history, top_countries, checked_at`,
         [siteId, domain, p.organic_traffic, p.traffic_value, JSON.stringify(p.history), JSON.stringify(p.top_countries), JSON.stringify(raw), userId]
     );
-    return r.rows[0];
+    // The site's own Traffic follows the latest Ahrefs number (old values are kept in site_traffic_log)
+    if (p.organic_traffic !== null) {
+        const value = Math.round(p.organic_traffic);
+        const old = await query(
+            `UPDATE new_sites ns SET traffic = $1::float8,
+                traffic_source = CASE WHEN ${SOURCE_IS_NUMBER('prev.traffic_source')} THEN $1::text ELSE ns.traffic_source END,
+                updated_at = NOW()
+             FROM (SELECT id, traffic, traffic_source FROM new_sites WHERE id = $2) prev
+             WHERE ns.id = prev.id
+               AND (prev.traffic IS DISTINCT FROM $1::float8
+                    OR (${SOURCE_IS_NUMBER('prev.traffic_source')} AND prev.traffic_source IS DISTINCT FROM $1::text))
+             RETURNING prev.traffic AS previous, prev.traffic_source AS previous_source`, [String(value), siteId]);
+        if (old.rows.length) {
+            await query(`INSERT INTO site_traffic_log (site_id, action, organic_traffic, previous_traffic, previous_traffic_source, user_id)
+                         VALUES ($1,'traffic_set',$2,$3,$4,$5)`,
+                [siteId, value, old.rows[0].previous, old.rows[0].previous_source, userId]);
+        }
+    }
+    // what the site lists show in their Traffic column (traffic_source), so the row can update without a reload
+    const site = (await query(`SELECT traffic_source FROM new_sites WHERE id = $1`, [siteId])).rows[0];
+    return { ...r.rows[0], site_traffic: site ? site.traffic_source : null };
 };
 
 const get = async (siteId) => {
