@@ -270,7 +270,9 @@ server.listen(PORT, '0.0.0.0', () => {
   if (process.env.MARKETPLACE_ENABLED === 'true') require('./utils/marketplacePlanEmails').startPlanReminders();
 
   // FAQ page content (tabs + order)
-  require('./utils/faqs').ensureSchema().catch(err => console.error('FAQ schema setup failed:', err.message));
+  require('./utils/faqs').ensureSchema()
+    .then(() => require('./utils/faqs').seedStarterFaqs()) // first questions for the FAQ page – once
+    .catch(err => console.error('FAQ setup failed:', err.message));
 
   // Ahrefs traffic checks (View All Sites → Check traffic)
   require('./utils/siteTraffic').ensureSchema().catch(err => console.error('Site traffic schema setup failed:', err.message));
