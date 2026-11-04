@@ -225,6 +225,7 @@ app.get('/health', (req, res) => {
 
 // API Routes
 app.use('/api/auth', authRoutes);
+app.use('/api/public', require('./routes/public')); // public website content (FAQ page)
 app.use('/api/admin', adminRoutes);
 app.use('/api/team', teamRoutes);
 app.use('/api/manager', managerRoutes);
@@ -267,6 +268,9 @@ server.listen(PORT, '0.0.0.0', () => {
     .catch(err => console.error('Marketplace schema setup failed:', err.message));
   // Pro plan emails (3 days left / ended) – only while the storefront is on
   if (process.env.MARKETPLACE_ENABLED === 'true') require('./utils/marketplacePlanEmails').startPlanReminders();
+
+  // FAQ page content (tabs + order)
+  require('./utils/faqs').ensureSchema().catch(err => console.error('FAQ schema setup failed:', err.message));
 
   // Ahrefs traffic checks (View All Sites → Check traffic)
   require('./utils/siteTraffic').ensureSchema().catch(err => console.error('Site traffic schema setup failed:', err.message));
