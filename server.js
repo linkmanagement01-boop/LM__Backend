@@ -274,6 +274,12 @@ server.listen(PORT, '0.0.0.0', () => {
     .then(() => require('./utils/faqs').seedStarterFaqs()) // first questions for the FAQ page – once
     .catch(err => console.error('FAQ setup failed:', err.message));
 
+  // Order lists look up each order's latest process / detail row – without these indexes every lookup scans the table
+  const { query } = require('./config/database');
+  query(`CREATE INDEX IF NOT EXISTS new_order_processes_order_idx ON new_order_processes (new_order_id, id DESC)`)
+    .then(() => query(`CREATE INDEX IF NOT EXISTS new_order_process_details_process_idx ON new_order_process_details (new_order_process_id, id DESC)`))
+    .catch(err => console.error('Order index setup failed:', err.message));
+
   // Ahrefs traffic checks (View All Sites → Check traffic)
   require('./utils/siteTraffic').ensureSchema().catch(err => console.error('Site traffic schema setup failed:', err.message));
 

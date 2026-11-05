@@ -103,4 +103,25 @@ const getTrafficQueue = async (req, res, next) => {
     }
 };
 
-module.exports = { getSiteTraffic, saveSiteTraffic, getTrafficSuggestions, getTrafficSuggestionCounts, decideTrafficSuggestion, getTrafficQueue };
+/**
+ * @route POST /api/admin/traffic/lookup
+ * @desc  Read an Ahrefs result for a domain that isn't one of our sites (Traffic Lookup tool) – nothing is saved
+ */
+const lookupTraffic = async (req, res, next) => {
+    try {
+        const captures = Array.isArray(req.body.captures) ? req.body.captures.slice(0, 20).map(c => ({
+            url: String(c?.url || '').slice(0, 500),
+            body: c?.body,
+        })) : [];
+        const raw = { captures, text: '' };
+        if (Buffer.byteLength(JSON.stringify(raw)) > MAX_RAW_BYTES) return res.status(413).json({ message: 'Traffic data is too large' });
+        if (!captures.length) return res.status(400).json({ message: 'No traffic data was captured from Ahrefs' });
+        const { organic_traffic, top_countries } = siteTraffic.parse(raw);
+        const found = organic_traffic !== null || top_countries.length;
+        res.json({ traffic: { organic_traffic, top_countries }, message: found ? 'Checked' : 'No traffic numbers in the Ahrefs data' });
+    } catch (error) {
+        next(error);
+    }
+};
+
+module.exports = { getSiteTraffic, saveSiteTraffic, getTrafficSuggestions, getTrafficSuggestionCounts, decideTrafficSuggestion, getTrafficQueue, lookupTraffic };

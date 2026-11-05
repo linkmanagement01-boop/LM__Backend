@@ -276,6 +276,7 @@ const getDashboardStats = async (req, res, next) => {
         const ordersAddedResult = await dbQuery(
             `SELECT 
                 nop.id,
+                no.id as task_id,
                 no.order_id as manual_order_id,
                 no.client_name,
                 no.client_website,
@@ -342,6 +343,7 @@ const getDashboardStats = async (req, res, next) => {
             },
             orders_added_today: ordersAddedResult.rows.map(r => ({
                 id: r.id,
+                task_id: r.task_id, // the order – what /writer/order-added-notifications/detail/:id opens
                 manual_order_id: r.manual_order_id || `ORD-${r.id}`,
                 client_name: r.client_name,
                 client_website: r.client_website,
