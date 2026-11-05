@@ -120,6 +120,7 @@ router.get('/sites/categories', adminController.getSiteCategories);
 // Ahrefs traffic (saved by the LM Traffic Helper extension)
 router.get('/sites/:id/traffic', siteTrafficController.getSiteTraffic);
 router.post('/sites/:id/traffic', siteTrafficController.saveSiteTraffic);
+router.post('/traffic/lookup', siteTrafficController.lookupTraffic); // Traffic Lookup tool – nothing saved
 // Suggestions page (status rules after Ahrefs checks)
 router.get('/sites/traffic-suggestions', siteTrafficController.getTrafficSuggestions);
 router.get('/sites/traffic-queue', siteTrafficController.getTrafficQueue);
