@@ -4,6 +4,9 @@
 
 const { query, transaction } = require('../config/database');
 const { MARKETPLACES, DEFAULT_MARKETPLACE, RULE_KINDS, ensureSchema, getRules, applyRules, validateRules } = require('../utils/marketplace');
+const razorpay = require('../utils/razorpay');
+const paypal = require('../utils/paypal');
+const { countryName } = require('../utils/countries');
 
 const pickMarketplace = (v) => (MARKETPLACES.includes(v) ? v : DEFAULT_MARKETPLACE);
 const EXAMPLE_PRICES = [5, 10, 15, 20, 25, 30, 50, 60, 100, 200];
@@ -101,7 +104,7 @@ const getClients = async (req, res, next) => {
         const from = `FROM users u LEFT JOIN marketplace_plans mp ON mp.client_user_id = u.id WHERE ${where}`;
         const total = parseInt((await query(`SELECT COUNT(*) AS c ${from}`, params)).rows[0].c);
         const rows = (await query(
-            `SELECT u.id, u.name, u.email, u.status, u.created_at, u.last_login,
+            `SELECT u.id, u.name, u.email, u.status, u.created_at, u.last_login, u.country_code,
                     COALESCE((SELECT w.balance FROM wallets w WHERE w.user_id = u.id ORDER BY w.id DESC LIMIT 1), 0)::float AS balance,
                     COALESCE((SELECT SUM(cp.amount) FROM client_payments cp WHERE cp.client_user_id = u.id AND cp.status = 'completed'), 0)::float AS topups,
                     (SELECT COUNT(*) FROM marketplace_orders mo WHERE mo.client_user_id = u.id)::int AS orders,
@@ -114,7 +117,7 @@ const getClients = async (req, res, next) => {
         // Next money expiry + last order + pause date (worked out per client from the wallet history)
         const clients = await Promise.all(rows.map(async (c) => {
             const plan = await plans.getPlan(c.id);
-            return { ...c, last_order_at: plan.last_order_at, deactivates_on: plan.deactivates_on, next_expiry: plan.funds.next_expiry };
+            return { ...c, country: countryName(c.country_code), last_order_at: plan.last_order_at, deactivates_on: plan.deactivates_on, next_expiry: plan.funds.next_expiry };
         }));
         const stats = (await query(
             `SELECT COUNT(*)::int AS clients,
@@ -223,4 +226,58 @@ const updateFreeSites = async (req, res, next) => {
     }
 };
 
-module.exports = { getPricing, updatePricing, getClients, getClientPlan, grantClientPro, reactivateClient, getFreeSites, updateFreeSites };
+// ─── Payments: ₹ rate for Razorpay (India) ─────────────────────────────
+
+const INR_RATE_KEY = 'inr_per_usd';
+const FEE_DEFAULTS = { razorpay_gst_pct: 18, razorpay_fee_pct: 2, paypal_fee_pct: 6.5 }; // same as the storefront's defaults
+
+/** @route GET /api/admin/marketplace/payment-settings – ₹ rate + which gateways are set up */
+const getPaymentSettings = async (req, res, next) => {
+    try {
+        await plans.ensureSchema();
+        const rows = (await query(`SELECT key, value FROM marketplace_plan_settings WHERE key = ANY($1)`, [[INR_RATE_KEY, ...Object.keys(FEE_DEFAULTS)]])).rows;
+        const val = (k) => rows.find(r => r.key === k)?.value;
+        const fees = Object.fromEntries(Object.entries(FEE_DEFAULTS).map(([k, d]) => [k, val(k) !== undefined ? Number(val(k)) : d]));
+        res.json({
+            inr_per_usd: Number(val(INR_RATE_KEY)) || null,
+            fees,
+            razorpay: { configured: razorpay.isConfigured(), mode: razorpay.mode(), international: razorpay.internationalEnabled(), webhook: !!(process.env.RAZORPAY_WEBHOOK_SECRET || '').trim() },
+            paypal: { configured: paypal.isConfigured(), mode: paypal.mode() }
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route PUT /api/admin/marketplace/payment-settings  { inr_per_usd?, fees?: { razorpay_gst_pct, razorpay_fee_pct, paypal_fee_pct } }
+ * Used for new top-ups from now on.
+ */
+const updatePaymentSettings = async (req, res, next) => {
+    try {
+        await plans.ensureSchema();
+        const save = (key, value) => query(
+            `INSERT INTO marketplace_plan_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [key, String(value)]);
+        const bad = (message) => res.status(400).json({ error: 'Validation Error', message });
+        const out = {};
+        if (req.body.inr_per_usd !== undefined) {
+            const rate = Math.round(Number(req.body.inr_per_usd) * 100) / 100;
+            if (!(rate >= 1 && rate <= 1000)) return bad('Please enter a rate between ₹1 and ₹1000 per $1');
+            out.inr_per_usd = rate;
+        }
+        const fees = req.body.fees || {};
+        for (const k of Object.keys(FEE_DEFAULTS)) {
+            if (fees[k] === undefined) continue;
+            const v = Math.round(Number(fees[k]) * 100) / 100;
+            if (!(v >= 0 && v <= 50) || fees[k] === '' || fees[k] === null) return bad('Fees must be between 0% and 50%');
+            out[k] = v;
+        }
+        if (!Object.keys(out).length) return bad('Nothing to save');
+        for (const [k, v] of Object.entries(out)) await save(k === 'inr_per_usd' ? INR_RATE_KEY : k, v);
+        res.json({ message: 'Payment settings saved – used for new top-ups from now on', ...out });
+    } catch (error) {
+        next(error);
+    }
+};
+
+module.exports = { getPricing, updatePricing, getClients, getClientPlan, grantClientPro, reactivateClient, getFreeSites, updateFreeSites, getPaymentSettings, updatePaymentSettings };

@@ -187,9 +187,16 @@ const apiLimiter = rateLimit({
   max: 300, // Limit each IP to 300 requests per windowMs
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later.' }
+  message: { error: 'Too many requests, please try again later.' },
+  // a developer's own PC (npm run dev, not on Railway) isn't limited – every tab and test shares one IP there
+  skip: () => process.env.NODE_ENV === 'development' && !(process.env.RAILWAY_ENVIRONMENT_NAME || process.env.RAILWAY_PROJECT_ID)
 });
 app.use('/api/', apiLimiter);
+
+// Razorpay webhook needs the raw body to check its signature – registered before the JSON parser
+if (process.env.MARKETPLACE_ENABLED === 'true') {
+  app.post('/api/marketplace/razorpay/webhook', express.raw({ type: 'application/json', limit: '1mb' }), require('./controllers/marketplaceController').razorpayWebhook);
+}
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
