@@ -7,7 +7,7 @@
  *  - Cart: site + type (Guest Post / Niche Edit) + anchor + target URL
  *  - Checkout: pay from wallet (atomic), creates one marketplace order; behind it one client_order
  *    per type, so the team's existing Client Orders flow works unchanged
- *  - Orders, wallet (PayPal top-ups), notifications
+ *  - Orders, wallet (PayPal + Razorpay top-ups), notifications
  */
 
 const crypto = require('crypto');
@@ -18,14 +18,18 @@ const { validateSignupEmail } = require('../utils/emailValidation');
 const { sendEmail } = require('../utils/emailService');
 const { activeSiteSql, findInactiveBloggerSites } = require('../utils/bloggerStatus');
 const paypal = require('../utils/paypal');
+const razorpay = require('../utils/razorpay');
+const { COUNTRIES, cleanCountry, countryName } = require('../utils/countries');
 const mp = require('../utils/marketplace');
 const domainMetrics = require('../utils/domainMetrics');
 const plans = require('../utils/marketplacePlan');
-const { sendPlanEmail } = require('../utils/marketplacePlanEmails');
+const { sendPlanEmail, sendPlanEmailTo } = require('../utils/marketplacePlanEmails');
 
 const ORDER_TYPES = ['Guest Post', 'Niche Edit'];
-const TOPUP_MIN = 10;
+const TOPUP_MIN = 10;      // once Pro: any top-up from $10
 const TOPUP_MAX = 10000;
+const SIGNUP_CREDIT = 30;  // welcome credit on sign-up – usable once the first $499 top-up unlocks Pro
+const WELCOME_REMARK = 'Welcome credit';
 
 const escapeHtml = (s = '') => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const isHttpUrl = (v) => {
@@ -81,12 +85,14 @@ const requireActive = async (req, res, next) => {
 
 // ─── Auth ─────────────────────────────────────────────────────────────
 
-/** @route POST /api/marketplace/:marketplace/auth/send-code  { name, email, password, confirm_password } */
+/** @route POST /api/marketplace/:marketplace/auth/send-code  { name, email, country_code, password, confirm_password } */
 const sendSignupCode = async (req, res, next) => {
     try {
         const marketplace = marketplaceOf(req);
         const { name, email, password, confirm_password, accept_terms } = req.body;
         if (!name || String(name).trim().length < 2) return bad(res, 'Please enter your name (at least 2 characters)');
+        const country = cleanCountry(req.body.country_code);
+        if (!country) return bad(res, 'Please choose your country');
         if (accept_terms !== true) return bad(res, 'Please accept the Terms & Conditions to create your account');
         if (!password || String(password).length < 8) return bad(res, 'Password must be at least 8 characters');
         if (password !== confirm_password) return bad(res, 'Passwords do not match');
@@ -111,15 +117,19 @@ const sendSignupCode = async (req, res, next) => {
         const [passwordHash, codeHash] = await Promise.all([bcrypt.hash(String(password), 10), bcrypt.hash(code, 10)]);
         await query(`DELETE FROM marketplace_pending_signups WHERE LOWER(email) = LOWER($1)`, [cleanEmail]);
         await query(
-            `INSERT INTO marketplace_pending_signups (marketplace, email, name, password_hash, code_hash, attempts, expires_at, last_sent_at)
-             VALUES ($1,$2,$3,$4,$5,0, NOW() + INTERVAL '10 minutes', NOW())`,
-            [marketplace, cleanEmail, String(name).trim(), passwordHash, codeHash]
+            `INSERT INTO marketplace_pending_signups (marketplace, email, name, password_hash, code_hash, attempts, expires_at, last_sent_at, country_code)
+             VALUES ($1,$2,$3,$4,$5,0, NOW() + INTERVAL '10 minutes', NOW(), $6)`,
+            [marketplace, cleanEmail, String(name).trim(), passwordHash, codeHash, country]
         );
 
         const onRailway = !!(process.env.RAILWAY_ENVIRONMENT_NAME || process.env.RAILWAY_PROJECT_ID);
-        const devMode = !onRailway && process.env.NODE_ENV === 'development' && !process.env.SMTP_PASSWORD && !process.env.EMAILIT_API_KEY;
+        // A developer's own PC (npm run dev, not Railway): the code is also given back so the signup page can show it –
+        // local email often can't send. Never on Railway.
+        const localDev = !onRailway && process.env.NODE_ENV === 'development';
+        const devMode = localDev && !process.env.SMTP_PASSWORD && !process.env.EMAILIT_API_KEY;
         if (devMode) {
             console.log(`🔑 [DEV ONLY] Marketplace verification code for ${cleanEmail}: ${code}`);
+            return res.json({ message: 'Verification code created (local dev)', email: cleanEmail, dev_code: code });
         } else {
             const brand = mp.getBrand(marketplace);
             const sent = await sendEmail(cleanEmail, `Verify your email – ${brand.name}`, `
@@ -130,6 +140,10 @@ const sendSignupCode = async (req, res, next) => {
                   <p class="value" style="font-size:34px; letter-spacing:8px;">${code}</p>
                 </div>
                 <p>This code expires in <strong>10 minutes</strong>. If you didn't try to sign up, you can ignore this email.</p>`, { brand });
+            if (!sent && localDev) {
+                console.log(`🔑 [DEV ONLY] Email failed – marketplace verification code for ${cleanEmail}: ${code}`);
+                return res.json({ message: 'Email could not be sent (local dev) – code shown on the page', email: cleanEmail, dev_code: code });
+            }
             if (!sent) {
                 await query(`DELETE FROM marketplace_pending_signups WHERE LOWER(email) = LOWER($1)`, [cleanEmail]);
                 return res.status(500).json({ error: 'Email Failed', message: 'Could not send the verification email. Please try again later.' });
@@ -169,14 +183,21 @@ const verifySignupCode = async (req, res, next) => {
 
         const user = await transaction(async (client) => {
             const created = (await client.query(
-                `INSERT INTO users (name, email, password, role, status, marketplace, email_verified_at, created_at, updated_at)
-                 SELECT $1::text, $2::text, $3::text, 'client', 1, $4::text, NOW(), NOW(), NOW()
+                `INSERT INTO users (name, email, password, role, status, marketplace, email_verified_at, created_at, updated_at, country_code)
+                 SELECT $1::text, $2::text, $3::text, 'client', 1, $4::text, NOW(), NOW(), NOW(), $5::text
                  WHERE NOT EXISTS (SELECT 1 FROM users WHERE LOWER(email) = LOWER($2::text))
                  RETURNING id, name, email`,
-                [pending.name, cleanEmail, pending.password_hash, marketplace]
+                [pending.name, cleanEmail, pending.password_hash, marketplace, pending.country_code || null]
             )).rows[0];
             if (!created) return null;
-            await client.query(`INSERT INTO wallets (user_id, balance, created_at, updated_at) VALUES ($1, 0, NOW(), NOW())`, [created.id]);
+            const wallet = (await client.query(
+                `INSERT INTO wallets (user_id, balance, created_at, updated_at) VALUES ($1, $2, NOW(), NOW()) RETURNING id`, [created.id, SIGNUP_CREDIT]
+            )).rows[0];
+            await client.query(
+                `INSERT INTO wallet_histories (wallet_id, type, price, remarks, status, created_at, updated_at, approved_date)
+                 VALUES ($1,'Credit',$2,$3,1,NOW(),NOW(),NOW())`,
+                [wallet.id, SIGNUP_CREDIT, `${WELCOME_REMARK} – $${SIGNUP_CREDIT} for signing up`]
+            );
             await plans.acceptTerms(client, created.id); // a code is only sent after the Terms were accepted
             await client.query(`DELETE FROM marketplace_pending_signups WHERE id = $1`, [pending.id]);
             return created;
@@ -184,7 +205,7 @@ const verifySignupCode = async (req, res, next) => {
         if (!user) return res.status(409).json({ error: 'Conflict', message: 'An account with this email already exists – please log in' });
 
         const token = jwt.sign({ id: user.id, email: user.email, role: 'Client', marketplace }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '24h' });
-        res.status(201).json({ message: 'Account created', token, user: { id: user.id, name: user.name, email: user.email, wallet_balance: 0 } });
+        res.status(201).json({ message: `Account created – $${SIGNUP_CREDIT} welcome credit added to your wallet`, token, user: { id: user.id, name: user.name, email: user.email, wallet_balance: SIGNUP_CREDIT } });
     } catch (error) {
         next(error);
     }
@@ -221,7 +242,8 @@ const me = async (req, res, next) => {
         const w = (await query(`SELECT COALESCE(balance, 0) AS balance FROM wallets WHERE user_id = $1 ORDER BY id DESC LIMIT 1`, [req.client.id])).rows[0];
         const cart = (await query(`SELECT COUNT(*) AS c FROM marketplace_cart_items WHERE client_user_id = $1`, [req.client.id])).rows[0];
         const plan = await plans.getPlan(req.client.id);
-        res.json({ user: { id: req.client.id, name: req.client.name, email: req.client.email }, wallet_balance: Number(w?.balance || 0), cart_count: parseInt(cart.c), plan });
+        const country = (await query(`SELECT country_code FROM users WHERE id = $1`, [req.client.id])).rows[0]?.country_code || null;
+        res.json({ user: { id: req.client.id, name: req.client.name, email: req.client.email, country_code: country }, wallet_balance: Number(w?.balance || 0), cart_count: parseInt(cart.c), plan });
     } catch (error) {
         next(error);
     }
@@ -288,7 +310,8 @@ const getSites = async (req, res, next) => {
         if (!pro && page > 1) {
             return res.status(403).json({ error: 'Pro Required', code: 'pro_required', message: 'Unlock Pro to see more pages of sites' });
         }
-        params.push(pro ? [] : await plans.freeDomains(marketplaceOf(req)));
+        const freeList = pro ? [] : await plans.freeDomains(marketplaceOf(req));
+        params.push(freeList);
         const isFreeSql = `(${plans.domainKeySql('ns')} = ANY($${params.length}::text[]))`;
         const filtered = ['category', 'min_price', 'max_price', 'min_dr', 'max_dr', 'min_da', 'max_da', 'min_traffic', 'max_traffic']
             .some(k => q[k] !== undefined && q[k] !== '');
@@ -326,8 +349,12 @@ const getSites = async (req, res, next) => {
             `SELECT ns.id, ns.root_domain, COALESCE(NULLIF(ns.category, ''), ns.niche) AS category, ns.website_niche,
                     ns.da, ns.dr, ns.rd, ${trafficSql} AS traffic, ns.spam_score, ns.country_source AS country,
                     ns.sample_url, ns.created_at, ${isFreeSql} AS is_free,
-                    ${gpPrice} AS gp_price, ${nePrice} AS niche_edit_price
+                    ${gpPrice} AS gp_price, ${nePrice} AS niche_edit_price,
+                    -- latest Ahrefs check (same as the admin cards); only client-safe fields
+                    st.organic_traffic::float8 AS ahrefs_traffic, st.checked_at AS ahrefs_checked_at,
+                    st.history AS ahrefs_history, st.top_countries AS ahrefs_countries, st.growth_pct::float8 AS growth_pct
              FROM new_sites ns
+             LEFT JOIN site_traffic st ON st.site_id = ns.id
              WHERE ${whereSql}
              ORDER BY ${pro ? '' : 'is_free DESC, '}${orderBy}, ns.id DESC
              LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
@@ -364,6 +391,7 @@ const getSites = async (req, res, next) => {
         res.json({
             plan: { tier: pro ? 'pro' : 'free' },
             free_matches: pro ? null : parseInt(counted.free_c),
+            free_sites: pro ? null : freeList.length, // how many free sites a Free-plan search looks through
             sites: rows,
             pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
             fc,
@@ -511,6 +539,10 @@ const projectOf = async (req, projectId) => {
 /** @route POST /api/marketplace/:marketplace/cart  { site_id, order_type, anchor_text, target_url, ...content details } */
 const addToCart = async (req, res, next) => {
     try {
+        // Ordering (and the cart) opens with the first $499+ top-up
+        if (!(await plans.isPro(req.client.id))) {
+            return res.status(403).json({ ...PRO_REQUIRED, message: `Add $${plans.PRO_PRICE} to your wallet to unlock Pro and start ordering` });
+        }
         const fc = req.body.fc === true;
         const rules = await mp.getRules(marketplaceOf(req), fc ? 'fc' : 'normal');
         const { site, price } = await priceFor(parseInt(req.body.site_id), req.body.order_type, rules, fc);
@@ -658,6 +690,10 @@ const checkout = async (req, res, next) => {
         const clientId = req.client.id;
         const { items, total } = await cartContents(clientId, marketplace);
         if (items.length === 0) return bad(res, 'Your cart is empty');
+        // Ordering opens with the first $499+ top-up (Pro) – say so before any other cart check
+        if (!(await plans.isPro(clientId))) {
+            return res.status(403).json({ ...PRO_REQUIRED, message: `Add $${plans.PRO_PRICE} to your wallet to unlock Pro and place your order` });
+        }
         const unavailable = items.filter(i => !i.available);
         if (unavailable.length) {
             return bad(res, `Please remove sites that are no longer available: ${unavailable.map(i => i.root_domain || `#${i.site_id}`).join(', ')}`);
@@ -836,7 +872,130 @@ const getOrder = async (req, res, next) => {
     }
 };
 
-// ─── Wallet + PayPal ──────────────────────────────────────────────────
+// ─── Wallet: PayPal + Razorpay ────────────────────────────────────────
+
+// ₹ per $1 for Razorpay top-ups in India – set by admin (Marketplace Pricing), so prices don't move on their own
+const INR_RATE_KEY = 'inr_per_usd';
+const getInrRate = async () => {
+    const v = Number((await query(`SELECT value FROM marketplace_plan_settings WHERE key = $1`, [INR_RATE_KEY])).rows[0]?.value);
+    return v > 0 ? v : null;
+};
+
+// Fees added on top of a top-up – the wallet always gets the amount the client chose. Admin can change them.
+const FEE_DEFAULTS = { razorpay_gst_pct: 18, razorpay_fee_pct: 2, paypal_fee_pct: 6.5 };
+const getFeeSettings = async () => {
+    const rows = (await query(`SELECT key, value FROM marketplace_plan_settings WHERE key = ANY($1)`, [Object.keys(FEE_DEFAULTS)])).rows;
+    const fees = { ...FEE_DEFAULTS };
+    for (const r of rows) { const v = Number(r.value); if (r.value !== null && v >= 0 && v <= 50) fees[r.key] = v; }
+    return fees;
+};
+const r2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+
+/**
+ * What the client pays for a $ top-up:
+ *  razorpay (India) → ₹ amount, + GST on the amount, + payment fee on (amount + GST)
+ *  paypal (abroad)  → $ amount + platform fee, no GST
+ * → { currency, base, tax, fee, total } in the paid currency
+ */
+const priceTopup = (amountUsd, method, rate, fees) => {
+    if (method === 'razorpay') {
+        const base = r2(amountUsd * rate);
+        const tax = r2(base * fees.razorpay_gst_pct / 100);
+        const fee = r2((base + tax) * fees.razorpay_fee_pct / 100);
+        return { currency: 'INR', base, tax, fee, total: r2(base + tax + fee) };
+    }
+    const fee = r2(amountUsd * fees.paypal_fee_pct / 100);
+    return { currency: 'USD', base: amountUsd, tax: 0, fee, total: r2(amountUsd + fee) };
+};
+
+/**
+ * Payment options for a client's country – one method each:
+ *  India   → Razorpay in ₹ (+ GST + payment fee)
+ *  Abroad  → PayPal in $ (+ platform fee)
+ */
+const paymentOptions = async (countryCode) => {
+    const india = countryCode === 'IN';
+    const [rate, fees] = await Promise.all([getInrRate(), getFeeSettings()]);
+    return {
+        country_code: countryCode || null,
+        country: countryName(countryCode),
+        needs_country: !countryCode,
+        paypal: {
+            available: !!countryCode && !india && paypal.isConfigured(),
+            configured: paypal.isConfigured(),
+            client_id: paypal.isConfigured() ? paypal.clientId() : null,
+            mode: paypal.mode(),
+            currency: 'USD',
+            fee_pct: fees.paypal_fee_pct
+        },
+        razorpay: {
+            available: india && razorpay.isConfigured() && !!rate,
+            configured: razorpay.isConfigured(),
+            mode: razorpay.mode(),
+            currency: 'INR',
+            inr_per_usd: india ? rate : null,
+            gst_pct: fees.razorpay_gst_pct,
+            fee_pct: fees.razorpay_fee_pct
+        },
+        _rate: rate,
+        _fees: fees
+    };
+};
+// the two internal fields stay on the server
+const publicOptions = ({ _rate, _fees, ...o }) => o;
+
+const clientCountry = async (clientId) => (await query(`SELECT country_code FROM users WHERE id = $1`, [clientId])).rows[0]?.country_code || null;
+
+/**
+ * Credit a top-up exactly once: only the first call flips the payment pending → completed,
+ * adds the $ amount to the wallet (a 12-month lot – the remark must say "top-up") and applies the Pro rule.
+ * `done` = { sql: 'col = $1', value } for the provider's capture / payment id. Returns null when already credited.
+ */
+const creditTopup = (payment, done, remark) => transaction(async (client) => {
+    const flipped = (await client.query(
+        `UPDATE client_payments SET status = 'completed', ${done.sql}, updated_at = NOW()
+         WHERE id = $2 AND status = 'pending' RETURNING id`,
+        [done.value, payment.id]
+    )).rows[0];
+    if (!flipped) return null;
+    let wallet = (await client.query(`SELECT id FROM wallets WHERE user_id = $1 ORDER BY id DESC LIMIT 1 FOR UPDATE`, [payment.client_user_id])).rows[0];
+    if (!wallet) wallet = (await client.query(`INSERT INTO wallets (user_id, balance, created_at, updated_at) VALUES ($1,0,NOW(),NOW()) RETURNING id`, [payment.client_user_id])).rows[0];
+    await client.query(`UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE id = $2`, [payment.amount, wallet.id]);
+    await client.query(
+        `INSERT INTO wallet_histories (wallet_id, type, price, remarks, status, created_at, updated_at, approved_date)
+         VALUES ($1,'Credit',$2,$3,1,NOW(),NOW(),NOW())`,
+        [wallet.id, payment.amount, remark]
+    );
+    // Same transaction: a $499+ top-up switches Pro on (once, for life)
+    return await plans.applyTopup(client, payment.client_user_id, payment.amount);
+});
+
+/** The response after a top-up: new balance, plan and message (+ the Pro email once) */
+const topupResult = async (clientId, amount, credited) => {
+    const w = (await query(`SELECT COALESCE(balance, 0) AS balance FROM wallets WHERE user_id = $1 ORDER BY id DESC LIMIT 1`, [clientId])).rows[0];
+    const plan = await plans.getPlan(clientId);
+    let message = credited ? `$${Number(amount).toFixed(2)} added to your wallet` : 'Payment already added to your wallet';
+    if (credited?.became_pro) {
+        message += ' – you are now on Pro, for life';
+        sendPlanEmailTo(clientId, 'pro').catch(err => console.error('[Marketplace] Pro email failed:', err.message));
+    }
+    return { message, wallet_balance: Number(w?.balance || 0), plan, became_pro: !!credited?.became_pro };
+};
+
+const topupAmount = (raw) => Math.round(Number(raw) * 100) / 100;
+/** Before Pro the first top-up must be $499+ (it unlocks Pro); after that any amount from $10 */
+const topupLimits = async (clientId) => {
+    const pro = await plans.isPro(clientId);
+    return { min: pro ? TOPUP_MIN : plans.PRO_PRICE, max: TOPUP_MAX, first_topup: !pro };
+};
+const checkAmount = async (res, clientId, amount) => {
+    const lim = await topupLimits(clientId);
+    if (amount >= lim.min && amount <= lim.max) return true;
+    bad(res, lim.first_topup
+        ? `Your first top-up must be at least $${lim.min} – it unlocks Pro and ordering`
+        : `Please enter an amount between $${lim.min} and $${lim.max}`);
+    return false;
+};
 
 /** @route GET /api/marketplace/:marketplace/wallet */
 const getWallet = async (req, res, next) => {
@@ -853,13 +1012,14 @@ const getWallet = async (req, res, next) => {
                     COALESCE(SUM(CASE WHEN LOWER(type) = 'debit' AND remarks LIKE '${plans.EXPIRED_REMARK}%' THEN price END), 0)::float AS expired
              FROM wallet_histories WHERE wallet_id = $1`, [w.id]
         )).rows[0] : { added: 0, spent: 0, refunded: 0, expired: 0 };
+        const options = await paymentOptions(await clientCountry(req.client.id));
         res.json({
             balance: Number(w?.balance || 0),
             totals,
             funds: await plans.walletFunds(req.client.id),
             history,
-            paypal: { configured: paypal.isConfigured(), client_id: paypal.isConfigured() ? paypal.clientId() : null, mode: paypal.mode(), currency: 'USD' },
-            topup_limits: { min: TOPUP_MIN, max: TOPUP_MAX }
+            ...publicOptions(options),
+            topup_limits: await topupLimits(req.client.id)
         });
     } catch (error) {
         next(error);
@@ -870,15 +1030,19 @@ const getWallet = async (req, res, next) => {
 const createPaypalTopup = async (req, res, next) => {
     try {
         if (!paypal.isConfigured()) return res.status(503).json({ error: 'Not Configured', message: 'PayPal is not set up yet' });
-        const amount = Math.round(Number(req.body.amount) * 100) / 100;
-        if (!(amount >= TOPUP_MIN && amount <= TOPUP_MAX)) return bad(res, `Please enter an amount between $${TOPUP_MIN} and $${TOPUP_MAX}`);
-        const paypalOrderId = await paypal.createOrder(amount, `wallet-${req.client.id}-${Date.now()}`);
+        const options = await paymentOptions(await clientCountry(req.client.id));
+        if (options.needs_country) return bad(res, 'Please add your country in your profile first');
+        if (!options.paypal.available) return bad(res, 'PayPal isn\'t available for your country – please use Razorpay');
+        const amount = topupAmount(req.body.amount);
+        if (!(await checkAmount(res, req.client.id, amount))) return;
+        const price = priceTopup(amount, 'paypal', null, options._fees); // amount + platform fee
+        const paypalOrderId = await paypal.createOrder(price.total, `wallet-${req.client.id}-${Date.now()}`);
         await query(
-            `INSERT INTO client_payments (client_user_id, amount, currency, status, provider, paypal_order_id, created_at, updated_at)
-             VALUES ($1,$2,'USD','pending','paypal',$3,NOW(),NOW())`,
-            [req.client.id, amount, paypalOrderId]
+            `INSERT INTO client_payments (client_user_id, amount, currency, status, provider, paypal_order_id, paid_amount, paid_currency, tax_amount, fee_amount, created_at, updated_at)
+             VALUES ($1,$2,'USD','pending','paypal',$3,$4,'USD',0,$5,NOW(),NOW())`,
+            [req.client.id, amount, paypalOrderId, price.total, price.fee]
         );
-        res.json({ paypal_order_id: paypalOrderId, amount });
+        res.json({ paypal_order_id: paypalOrderId, amount, fee: price.fee, total: price.total });
     } catch (error) {
         next(error);
     }
@@ -898,42 +1062,138 @@ const capturePaypalTopup = async (req, res, next) => {
         if (payment.status === 'completed') return res.json({ message: 'Payment already added to your wallet', already: true });
 
         const cap = await paypal.captureOrder(paypalOrderId);
-        if (cap.status !== 'COMPLETED' || cap.currency !== 'USD' || Math.abs(Number(cap.amount) - Number(payment.amount)) > 0.009) {
+        const charged = Number(payment.paid_amount ?? payment.amount); // amount + platform fee
+        if (cap.status !== 'COMPLETED' || cap.currency !== 'USD' || Math.abs(Number(cap.amount) - charged) > 0.009) {
             await query(`UPDATE client_payments SET status = 'failed', updated_at = NOW() WHERE id = $1 AND status = 'pending'`, [payment.id]);
             return bad(res, `PayPal did not complete the payment (status: ${cap.status || 'unknown'}). You have not been charged by us.`);
         }
-
-        const credited = await transaction(async (client) => {
-            // Only the first request flips pending → completed; any repeat credits nothing
-            const done = (await client.query(
-                `UPDATE client_payments SET status = 'completed', paypal_capture_id = $1, updated_at = NOW()
-                 WHERE id = $2 AND status = 'pending' RETURNING id`,
-                [cap.captureId, payment.id]
-            )).rows[0];
-            if (!done) return null;
-            let wallet = (await client.query(`SELECT id FROM wallets WHERE user_id = $1 ORDER BY id DESC LIMIT 1 FOR UPDATE`, [req.client.id])).rows[0];
-            if (!wallet) wallet = (await client.query(`INSERT INTO wallets (user_id, balance, created_at, updated_at) VALUES ($1,0,NOW(),NOW()) RETURNING id`, [req.client.id])).rows[0];
-            await client.query(`UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE id = $2`, [payment.amount, wallet.id]);
-            await client.query(
-                `INSERT INTO wallet_histories (wallet_id, type, price, remarks, status, created_at, updated_at, approved_date)
-                 VALUES ($1,'Credit',$2,$3,1,NOW(),NOW(),NOW())`,
-                [wallet.id, payment.amount, `Wallet top-up via PayPal (${cap.captureId || paypalOrderId})`]
-            );
-            // Same transaction: a $499+ top-up switches Pro on (once, for life)
-            return await plans.applyTopup(client, req.client.id, payment.amount);
-        });
-        const w = (await query(`SELECT COALESCE(balance, 0) AS balance FROM wallets WHERE user_id = $1 ORDER BY id DESC LIMIT 1`, [req.client.id])).rows[0];
-        const plan = await plans.getPlan(req.client.id);
-        let message = credited ? `$${Number(payment.amount).toFixed(2)} added to your wallet` : 'Payment already added to your wallet';
-        if (credited?.became_pro) {
-            message += ' – you are now on Pro, for life';
-            sendPlanEmail(req, 'pro').catch(err => console.error('[Marketplace] Pro email failed:', err.message));
-        }
-        res.json({ message, wallet_balance: Number(w?.balance || 0), plan, became_pro: !!credited?.became_pro });
+        const fee = Number(payment.fee_amount || 0);
+        const credited = await creditTopup(payment, { sql: 'paypal_capture_id = $1', value: cap.captureId },
+            `Wallet top-up via PayPal – paid $${charged.toFixed(2)}${fee ? ` incl. $${fee.toFixed(2)} platform fee` : ''} (${cap.captureId || paypalOrderId})`);
+        res.json(await topupResult(req.client.id, payment.amount, credited));
     } catch (error) {
         next(error);
     }
 };
+
+/**
+ * @route POST /api/marketplace/:marketplace/wallet/razorpay/create  { amount }  ($ for the wallet)
+ * India only: ₹ at the admin's rate + GST + payment fee. → what the Razorpay popup needs
+ */
+const createRazorpayTopup = async (req, res, next) => {
+    try {
+        if (!razorpay.isConfigured()) return res.status(503).json({ error: 'Not Configured', message: 'Razorpay is not set up yet' });
+        // Safety: live keys (real money) only on the live server, never on a local / test machine
+        const onRailway = !!(process.env.RAILWAY_ENVIRONMENT_NAME || process.env.RAILWAY_PROJECT_ID);
+        if (razorpay.mode() === 'live' && !onRailway) return res.status(503).json({ error: 'Not Configured', message: 'Live Razorpay keys are only used on the live server – use test keys (rzp_test_…) locally' });
+        const options = await paymentOptions(await clientCountry(req.client.id));
+        if (options.needs_country) return bad(res, 'Please add your country in your profile first');
+        if (!options.razorpay.available) return bad(res, 'Razorpay is only for clients in India – please use PayPal');
+        const amount = topupAmount(req.body.amount);
+        if (!(await checkAmount(res, req.client.id, amount))) return;
+
+        const price = priceTopup(amount, 'razorpay', options._rate, options._fees); // ₹ amount + GST + fee
+        const minor = Math.round(price.total * 100);                                // paise
+        const order = await razorpay.createOrder(minor, price.currency, `mp-${req.client.id}-${Date.now()}`,
+            { client_id: String(req.client.id), wallet_usd: amount.toFixed(2), gst_inr: price.tax.toFixed(2), fee_inr: price.fee.toFixed(2), marketplace: marketplaceOf(req) });
+        await query(
+            `INSERT INTO client_payments (client_user_id, amount, currency, status, provider, razorpay_order_id, paid_amount, paid_currency, tax_amount, fee_amount, created_at, updated_at)
+             VALUES ($1,$2,'USD','pending','razorpay',$3,$4,$5,$6,$7,NOW(),NOW())`,
+            [req.client.id, amount, order.id, price.total, price.currency, price.tax, price.fee]
+        );
+        res.json({
+            key_id: razorpay.keyId(),
+            order_id: order.id,
+            amount: minor,
+            currency: price.currency,
+            wallet_amount: amount,
+            paid_amount: price.total,
+            breakdown: price,
+            name: mp.getBrand(marketplaceOf(req)).name,
+            prefill: { name: req.client.name, email: req.client.email }
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * Check a Razorpay payment with Razorpay itself (never the browser): right order, captured, right amount.
+ * Captures it first when the account doesn't auto-capture. → { ok, payment, reason }
+ */
+const checkRazorpayPayment = async (payment, paymentId) => {
+    let p = await razorpay.fetchPayment(paymentId);
+    const minor = Math.round(Number(payment.paid_amount) * 100);
+    if (p.order_id !== payment.razorpay_order_id) return { ok: false, reason: 'This payment belongs to another order' };
+    if (p.status === 'authorized') p = await razorpay.capturePayment(paymentId, minor, payment.paid_currency);
+    if (p.status !== 'captured') return { ok: false, reason: `Razorpay did not complete the payment (status: ${p.status || 'unknown'})` };
+    if (Number(p.amount) !== minor || p.currency !== payment.paid_currency) return { ok: false, reason: 'The paid amount does not match this top-up' };
+    return { ok: true, payment: p };
+};
+
+const inr = (n) => `₹${Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const razorpayRemark = (payment, paymentId) => {
+    const extras = Number(payment.tax_amount || 0) || Number(payment.fee_amount || 0) ? ' incl. GST & payment fee' : '';
+    return `Wallet top-up via Razorpay – paid ${inr(payment.paid_amount)}${extras} (${paymentId})`;
+};
+
+/**
+ * @route POST /api/marketplace/:marketplace/wallet/razorpay/verify  { razorpay_order_id, razorpay_payment_id, razorpay_signature }
+ * Checks the popup's signature, then the payment with Razorpay, and credits the wallet exactly once.
+ */
+const verifyRazorpayTopup = async (req, res, next) => {
+    try {
+        const orderId = String(req.body.razorpay_order_id || '');
+        const paymentId = String(req.body.razorpay_payment_id || '');
+        const signature = String(req.body.razorpay_signature || '');
+        const payment = (await query(
+            `SELECT * FROM client_payments WHERE provider = 'razorpay' AND razorpay_order_id = $1 AND client_user_id = $2`, [orderId, req.client.id]
+        )).rows[0];
+        if (!payment) return bad(res, 'Payment not found', 404);
+        if (payment.status === 'completed') return res.json({ ...(await topupResult(req.client.id, payment.amount, null)), already: true });
+        if (!razorpay.verifyPaymentSignature(orderId, paymentId, signature)) {
+            return bad(res, 'Payment could not be verified – if money was taken, it will be added automatically or refunded by Razorpay');
+        }
+        const check = await checkRazorpayPayment(payment, paymentId);
+        if (!check.ok) return bad(res, `${check.reason}. You have not been charged by us.`);
+        const credited = await creditTopup(payment, { sql: 'razorpay_payment_id = $1', value: paymentId }, razorpayRemark(payment, paymentId));
+        res.json(await topupResult(req.client.id, payment.amount, credited));
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route POST /api/marketplace/razorpay/webhook   (Razorpay → us; raw body, X-Razorpay-Signature)
+ * Backup for a closed browser: payment.captured / order.paid credit the wallet if verify never ran.
+ * Events we can't use still get 200, so Razorpay doesn't keep retrying them.
+ */
+const razorpayWebhook = async (req, res) => {
+    try {
+        const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
+        if (!razorpay.verifyWebhookSignature(raw, req.get('x-razorpay-signature'))) return res.status(400).json({ error: 'Bad signature' });
+        const event = JSON.parse(raw.toString('utf8'));
+        if (!['payment.captured', 'order.paid'].includes(event.event)) return res.json({ ok: true, ignored: event.event });
+        const p = event.payload?.payment?.entity;
+        if (!p?.order_id || !p?.id) return res.json({ ok: true, ignored: 'no payment' });
+        const payment = (await query(`SELECT * FROM client_payments WHERE provider = 'razorpay' AND razorpay_order_id = $1`, [p.order_id])).rows[0];
+        if (!payment || payment.status === 'completed') return res.json({ ok: true });
+        const check = await checkRazorpayPayment(payment, p.id);
+        if (!check.ok) {
+            console.error(`[Razorpay webhook] payment ${p.id} not credited: ${check.reason}`);
+            return res.json({ ok: true, credited: false });
+        }
+        const credited = await creditTopup(payment, { sql: 'razorpay_payment_id = $1', value: p.id }, razorpayRemark(payment, p.id));
+        if (credited?.became_pro) sendPlanEmailTo(payment.client_user_id, 'pro').catch(err => console.error('[Marketplace] Pro email failed:', err.message));
+        res.json({ ok: true, credited: !!credited });
+    } catch (error) {
+        console.error('[Razorpay webhook]', error.message);
+        res.status(500).json({ error: 'Webhook failed' }); // Razorpay retries later
+    }
+};
+
+/** @route GET /api/marketplace/:marketplace/countries – for signup + profile */
+const getCountries = (req, res) => res.json({ countries: COUNTRIES.map(([code, name]) => ({ code, name })) });
 
 // ─── Notifications ────────────────────────────────────────────────────
 
@@ -1059,7 +1319,7 @@ const PROFILE_FIELDS = ['name', 'mobile_number', 'whatsapp', 'skype', 'address']
 const getProfile = async (req, res, next) => {
     try {
         const u = (await query(
-            `SELECT id, name, email, mobile_number, whatsapp, skype, address, created_at, last_login FROM users WHERE id = $1`, [req.client.id]
+            `SELECT id, name, email, mobile_number, whatsapp, skype, address, country_code, created_at, last_login FROM users WHERE id = $1`, [req.client.id]
         )).rows[0];
         res.json({ profile: u });
     } catch (error) {
@@ -1067,7 +1327,7 @@ const getProfile = async (req, res, next) => {
     }
 };
 
-/** @route PUT /api/marketplace/:marketplace/profile  { name, mobile_number, whatsapp, skype, address } (email can't change) */
+/** @route PUT /api/marketplace/:marketplace/profile  { name, country_code, mobile_number, whatsapp, skype, address } (email can't change) */
 const updateProfile = async (req, res, next) => {
     try {
         const v = {};
@@ -1076,10 +1336,12 @@ const updateProfile = async (req, res, next) => {
         if (v.name.length > 100) return bad(res, 'Name is too long');
         for (const f of ['mobile_number', 'whatsapp', 'skype']) if (v[f].length > 50) return bad(res, 'Contact details are too long');
         if (v.address.length > 500) return bad(res, 'Address is too long');
+        const country = cleanCountry(req.body.country_code);
+        if (!country) return bad(res, 'Please choose your country');
         const u = (await query(
-            `UPDATE users SET name = $1, mobile_number = NULLIF($2, ''), whatsapp = NULLIF($3, ''), skype = NULLIF($4, ''), address = NULLIF($5, ''), updated_at = NOW()
-             WHERE id = $6 RETURNING id, name, email, mobile_number, whatsapp, skype, address, created_at, last_login`,
-            [v.name, v.mobile_number, v.whatsapp, v.skype, v.address, req.client.id]
+            `UPDATE users SET name = $1, mobile_number = NULLIF($2, ''), whatsapp = NULLIF($3, ''), skype = NULLIF($4, ''), address = NULLIF($5, ''), country_code = $7, updated_at = NOW()
+             WHERE id = $6 RETURNING id, name, email, mobile_number, whatsapp, skype, address, country_code, created_at, last_login`,
+            [v.name, v.mobile_number, v.whatsapp, v.skype, v.address, req.client.id, country]
         )).rows[0];
         res.json({ message: 'Profile saved', profile: u });
     } catch (error) {
@@ -1301,6 +1563,6 @@ module.exports = {
     checkMarketplace, requireClient,
     sendSignupCode, verifySignupCode, login, me,
     getSites, getCategories, getCart, addToCart, updateCartItem, removeCartItem, checkout,
-    getOrders, getOrder, getWallet, createPaypalTopup, capturePaypalTopup,
+    getOrders, getOrder, getWallet, createPaypalTopup, createRazorpayTopup, verifyRazorpayTopup, razorpayWebhook, getCountries, capturePaypalTopup,
     getNotifications, markNotificationsRead
 };

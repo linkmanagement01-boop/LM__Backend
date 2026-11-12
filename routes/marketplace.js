@@ -46,6 +46,7 @@ router.use('/:marketplace', m.checkMarketplace);
 router.post('/:marketplace/auth/send-code', authLimiter, m.sendSignupCode);
 router.post('/:marketplace/auth/verify', authLimiter, m.verifySignupCode);
 router.post('/:marketplace/auth/login', authLimiter, m.login);
+router.get('/:marketplace/countries', m.getCountries); // signup + profile
 
 // Logged-in marketplace clients
 router.get('/:marketplace/me', m.requireClient, m.me);
@@ -84,6 +85,8 @@ router.get('/:marketplace/orders/:id', m.requireClient, m.requireActive, m.getOr
 router.get('/:marketplace/wallet', m.requireClient, m.requireActive, m.getWallet);
 router.post('/:marketplace/wallet/paypal/create', m.requireClient, m.requireActive, m.createPaypalTopup);
 router.post('/:marketplace/wallet/paypal/capture', m.requireClient, m.capturePaypalTopup); // never lose an approved payment
+router.post('/:marketplace/wallet/razorpay/create', m.requireClient, m.requireActive, m.createRazorpayTopup);
+router.post('/:marketplace/wallet/razorpay/verify', m.requireClient, m.verifyRazorpayTopup); // never lose a paid top-up
 
 router.get('/:marketplace/dashboard', m.requireClient, m.requireActive, m.getDashboard);
 router.get('/:marketplace/transactions', m.requireClient, m.requireActive, m.getTransactions);

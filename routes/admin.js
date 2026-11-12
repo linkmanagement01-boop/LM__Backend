@@ -136,6 +136,8 @@ router.post('/marketplace/clients/:id/grant-pro', marketplaceAdminController.gra
 router.post('/marketplace/clients/:id/reactivate', marketplaceAdminController.reactivateClient);
 router.get('/marketplace/free-sites', marketplaceAdminController.getFreeSites);
 router.put('/marketplace/free-sites', marketplaceAdminController.updateFreeSites);
+router.get('/marketplace/payment-settings', marketplaceAdminController.getPaymentSettings);
+router.put('/marketplace/payment-settings', marketplaceAdminController.updatePaymentSettings);
 router.get('/sites/deleted-list', adminController.getDeletedWebsitesList);
 router.put('/sites/:id/delete', adminController.deleteWebsite);
 router.put('/sites/:id/restore', adminController.restoreWebsite);

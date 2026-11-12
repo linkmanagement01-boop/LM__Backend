@@ -108,6 +108,18 @@ const ensureSchema = () => (schemaReady = schemaReady || (async () => {
     await query(`ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS paypal_capture_id VARCHAR(64)`);
     await query(`CREATE UNIQUE INDEX IF NOT EXISTS client_payments_paypal_order_uq ON client_payments (paypal_order_id) WHERE paypal_order_id IS NOT NULL`);
 
+    // Razorpay top-ups: wallet amount stays in $ (amount/currency); what the client actually paid (₹ or $) is kept too
+    await query(`ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12,2)`);
+    await query(`ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS paid_currency VARCHAR(3)`);
+    // fees added on top of the top-up (in the paid currency): tax = GST (India), fee = payment / platform fee
+    await query(`ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS tax_amount NUMERIC(12,2) NOT NULL DEFAULT 0`);
+    await query(`ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS fee_amount NUMERIC(12,2) NOT NULL DEFAULT 0`);
+    await query(`CREATE UNIQUE INDEX IF NOT EXISTS client_payments_rzp_order_uq ON client_payments (razorpay_order_id) WHERE provider = 'razorpay' AND razorpay_order_id IS NOT NULL`);
+
+    // Client country (ISO code) – decides the payment options (IN → Razorpay in ₹)
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS country_code VARCHAR(2)`);
+    await query(`ALTER TABLE marketplace_pending_signups ADD COLUMN IF NOT EXISTS country_code VARCHAR(2)`);
+
     // Projects: a client's own website (abc.com) + up to 3 competitors; every order line belongs to one
     await query(`
         CREATE TABLE IF NOT EXISTS marketplace_projects (
