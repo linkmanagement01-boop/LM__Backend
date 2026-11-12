@@ -92,11 +92,12 @@ const decideTrafficSuggestion = async (req, res, next) => {
 /**
  * @route GET /api/admin/sites/traffic-queue?type=unchecked|recheck&status=Approved&limit=10  (also /api/manager/...)
  * @desc  Next sites for "Check 10 unchecked" / "Re-check 10" across the whole list; without type only the counts.
- *        Managers always get approved sites (their View All Sites list).
+ *        Managers follow their Status filter like admins; with no status picked their list shows approved sites.
  */
 const getTrafficQueue = async (req, res, next) => {
     try {
-        const status = req.user.role?.toLowerCase() === 'manager' ? 'Approved' : String(req.query.status || '');
+        const picked = String(req.query.status || '');
+        const status = req.user.role?.toLowerCase() === 'manager' ? (picked || 'Approved') : picked;
         res.json(await siteTraffic.queue({ type: req.query.type, status, limit: req.query.limit }));
     } catch (error) {
         next(error);
