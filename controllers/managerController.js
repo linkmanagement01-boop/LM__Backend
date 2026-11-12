@@ -635,12 +635,24 @@ const getRejectedOrders = async (req, res, next) => {
         // inflated counts by including records (status 7/8) that were later resubmitted
         // but still had a leftover reject_reason from a previous rejection cycle.
         // NOTE: User requested ALL rejected records (approx 1269), even those resubmitted.
+        // Optional searches (whole list): order_id, user (blogger name / email), domain (root domain)
+        const params = [];
+        const search = [];
+        const like = (v) => { params.push(`%${String(v).trim()}%`); return `$${params.length}`; };
+        if (String(req.query.order_id || '').trim()) search.push(`o.order_id ILIKE ${like(req.query.order_id)}`);
+        if (String(req.query.user || '').trim()) { const p = like(req.query.user); search.push(`(u.name ILIKE ${p} OR u.email ILIKE ${p})`); }
+        if (String(req.query.domain || '').trim()) search.push(`ns.root_domain ILIKE ${like(String(req.query.domain).replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/.*$/, ''))}`);
+        const searchSql = search.length ? ` AND ${search.join(' AND ')}` : '';
+
         const countResult = await query(
             `SELECT COUNT(*) as total FROM new_order_process_details nopd
              JOIN new_order_processes nop ON nopd.new_order_process_id = nop.id
              JOIN new_orders o ON nop.new_order_id = o.id
+             LEFT JOIN users u ON nopd.vendor_id = u.id
+             LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
              WHERE (nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != '')) AND ${activeBloggerSql('nopd.vendor_id')}
-               AND o.order_id NOT LIKE 'CLT-%'`
+               AND o.order_id NOT LIKE 'CLT-%'${searchSql}`,
+            params
         );
         const total = parseInt(countResult.rows[0]?.total || 0);
 
@@ -665,10 +677,10 @@ const getRejectedOrders = async (req, res, next) => {
              LEFT JOIN users u ON nopd.vendor_id = u.id
              LEFT JOIN new_sites ns ON nopd.new_site_id = ns.id
              WHERE (nopd.status = 11 OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) != '')) AND ${activeBloggerSql('nopd.vendor_id')}
-               AND o.order_id NOT LIKE 'CLT-%'
+               AND o.order_id NOT LIKE 'CLT-%'${searchSql}
              ORDER BY nopd.updated_at DESC
-             LIMIT $1 OFFSET $2`,
-            [limit, offset]
+             LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+            [...params, limit, offset]
         );
 
         res.json({
