@@ -138,6 +138,10 @@ router.get('/marketplace/free-sites', marketplaceAdminController.getFreeSites);
 router.put('/marketplace/free-sites', marketplaceAdminController.updateFreeSites);
 router.get('/marketplace/payment-settings', marketplaceAdminController.getPaymentSettings);
 router.put('/marketplace/payment-settings', marketplaceAdminController.updatePaymentSettings);
+// Marketplace outreach requests (clients asking for sites we don't have)
+const marketplaceOutreach = require('../controllers/marketplaceOutreachController');
+router.get('/marketplace/outreach', marketplaceOutreach.listRequests);
+router.put('/marketplace/outreach/:id', marketplaceOutreach.updateStatus);
 router.get('/sites/deleted-list', adminController.getDeletedWebsitesList);
 router.put('/sites/:id/delete', adminController.deleteWebsite);
 router.put('/sites/:id/restore', adminController.restoreWebsite);

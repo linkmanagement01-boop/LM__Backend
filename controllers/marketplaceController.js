@@ -38,6 +38,9 @@ const isHttpUrl = (v) => {
     try { return !!new URL(s).hostname.includes('.'); } catch { return false; }
 };
 const marketplaceOf = (req) => req.params.marketplace;
+// Bulk domain search (marketplace search bar → "Bulk")
+const BULK_MAX = 30;
+const { cleanDomain: cleanOutreachDomain } = require('./marketplaceOutreachController');
 const bad = (res, message, code = 400) => res.status(code).json({ error: 'Validation Error', message });
 
 // ─── Middleware ───────────────────────────────────────────────────────
@@ -315,9 +318,15 @@ const getSites = async (req, res, next) => {
         const isFreeSql = `(${plans.domainKeySql('ns')} = ANY($${params.length}::text[]))`;
         const filtered = ['category', 'min_price', 'max_price', 'min_dr', 'max_dr', 'min_da', 'max_da', 'min_traffic', 'max_traffic']
             .some(k => q[k] !== undefined && q[k] !== '');
-        if (!pro && (!filtered || q.search)) where.push(isFreeSql); // default view + domain search: free sites only
+        // Bulk search: up to 30 exact domains ("a.com,b.com") – the answer says which were found and which not
+        const bulk = q.domains !== undefined
+            ? [...new Set(String(q.domains).split(/[\s,;]+/).map(cleanOutreachDomain).filter(Boolean))].slice(0, BULK_MAX)
+            : null;
+        if (bulk && !bulk.length) return bad(res, 'Please enter at least one valid domain, e.g. example.com');
+        if (!pro && (!filtered || q.search || bulk)) where.push(isFreeSql); // default view + domain search: free sites only
 
         if (q.search) add(p => `ns.root_domain ILIKE ${p}`, `%${String(q.search).trim()}%`);
+        if (bulk) add(p => `${plans.domainKeySql('ns')} = ANY(${p}::text[])`, bulk);
         // Category picked from the list (spellings that differ only in capitals count as one)
         if (q.category) add(p => `${categoryKeySql} = LOWER(TRIM(${p}))`, String(q.category));
         const range = (col, min, max) => {
@@ -388,7 +397,26 @@ const getSites = async (req, res, next) => {
                     MAX(GREATEST(COALESCE(${gpPrice}, 0), COALESCE(${nePrice}, 0))) AS max_price
              FROM new_sites ns WHERE ${siteListWhere} AND (${gpPrice} IS NOT NULL OR ${nePrice} IS NOT NULL)`
         )).rows[0] : stats;
+        // Bulk search: which of the asked domains are listed (same rules as the list itself)
+        let bulkResult;
+        if (bulk) {
+            const foundKeys = new Set((await query(
+                // is_free keeps $1 (the free list) in the query for Pro too, where the WHERE doesn't use it
+                `SELECT DISTINCT ${plans.domainKeySql('ns')} AS d, ${isFreeSql} AS is_free FROM new_sites ns WHERE ${whereSql}`, params
+            )).rows.map(r => r.d));
+            bulkResult = { requested: bulk, found: bulk.filter(d => foundKeys.has(d)), missing: bulk.filter(d => !foundKeys.has(d)) };
+            // Free plan: of the missing ones, which are on the marketplace for Pro (so "Go Pro", not outreach)
+            if (!pro && bulkResult.missing.length) {
+                const proKeys = new Set((await query(
+                    `SELECT DISTINCT ${plans.domainKeySql('ns')} AS d FROM new_sites ns
+                     WHERE ${siteListWhere} AND (${gpPrice} IS NOT NULL OR ${nePrice} IS NOT NULL) AND ${plans.domainKeySql('ns')} = ANY($1::text[])`,
+                    [bulkResult.missing]
+                )).rows.map(r => r.d));
+                bulkResult.in_pro = bulkResult.missing.filter(d => proKeys.has(d));
+            }
+        }
         res.json({
+            ...(bulkResult ? { bulk: bulkResult } : {}),
             plan: { tier: pro ? 'pro' : 'free' },
             free_matches: pro ? null : parseInt(counted.free_c),
             free_sites: pro ? null : freeList.length, // how many free sites a Free-plan search looks through
@@ -997,10 +1025,58 @@ const checkAmount = async (res, clientId, amount) => {
     return false;
 };
 
+/**
+ * Capture an approved PayPal top-up and credit the wallet (exactly once – creditTopup only flips 'pending').
+ * → { ok: true, credited } or { ok: false, message }
+ */
+const finishPaypalPayment = async (payment) => {
+    const cap = await paypal.captureOrder(payment.paypal_order_id);
+    const charged = Number(payment.paid_amount ?? payment.amount); // amount + platform fee
+    if (cap.status !== 'COMPLETED' || cap.currency !== 'USD' || Math.abs(Number(cap.amount) - charged) > 0.009) {
+        await query(`UPDATE client_payments SET status = 'failed', updated_at = NOW() WHERE id = $1 AND status = 'pending'`, [payment.id]);
+        return { ok: false, message: `PayPal did not complete the payment (status: ${cap.status || 'unknown'}). You have not been charged by us.` };
+    }
+    const fee = Number(payment.fee_amount || 0);
+    const credited = await creditTopup(payment, { sql: 'paypal_capture_id = $1', value: cap.captureId },
+        `Wallet top-up via PayPal – paid $${charged.toFixed(2)}${fee ? ` incl. $${fee.toFixed(2)} platform fee` : ''} (${cap.captureId || payment.paypal_order_id})`);
+    return { ok: true, credited };
+};
+
+/**
+ * Safety net: a client approved in PayPal but the page never sent the capture (tab closed, connection lost …).
+ * On every wallet load, ask PayPal about this client's recent pending top-ups and finish the approved ones.
+ * Orders never approved within 3 hours (PayPal's approval window) are closed as 'cancelled'.
+ * Never throws – the wallet still loads if PayPal is slow or down.
+ */
+const settlePendingPaypal = async (clientId) => {
+    if (!paypal.isConfigured()) return;
+    const pending = (await query(
+        `SELECT * FROM client_payments
+         WHERE client_user_id = $1 AND provider = 'paypal' AND status = 'pending' AND paypal_order_id IS NOT NULL
+           AND created_at > NOW() - INTERVAL '3 days' AND created_at < NOW() - INTERVAL '20 seconds'
+         ORDER BY id LIMIT 5`, [clientId]
+    )).rows;
+    for (const p of pending) {
+        try {
+            const { status } = await paypal.getOrder(p.paypal_order_id);
+            if (status === 'APPROVED' || status === 'COMPLETED') {
+                const done = await finishPaypalPayment(p);
+                if (done.credited?.became_pro) sendPlanEmailTo(clientId, 'pro').catch(err => console.error('[Marketplace] Pro email failed:', err.message));
+                console.log(`[Marketplace] PayPal top-up #${p.id} finished on wallet load: ${done.ok ? 'credited' : done.message}`);
+            } else if (['VOIDED', 'NOT_FOUND'].includes(status) || (status === 'CREATED' && Date.now() - new Date(p.created_at) > 3 * 3600e3)) {
+                await query(`UPDATE client_payments SET status = 'cancelled', updated_at = NOW() WHERE id = $1 AND status = 'pending'`, [p.id]);
+            }
+        } catch (err) {
+            console.error(`[Marketplace] PayPal check for top-up #${p.id} failed:`, err.message);
+        }
+    }
+};
+
 /** @route GET /api/marketplace/:marketplace/wallet */
 const getWallet = async (req, res, next) => {
     try {
-        const w = (await query(`SELECT id, COALESCE(balance, 0) AS balance FROM wallets WHERE user_id = $1 ORDER BY id DESC LIMIT 1`, [req.client.id])).rows[0];
+        await settlePendingPaypal(req.client.id).catch(err => console.error('[Marketplace] PayPal sweep failed:', err.message));
+        const w =(await query(`SELECT id, COALESCE(balance, 0) AS balance FROM wallets WHERE user_id = $1 ORDER BY id DESC LIMIT 1`, [req.client.id])).rows[0];
         const history = w ? (await query(
             `SELECT id, type, price::float AS amount, remarks, created_at FROM wallet_histories WHERE wallet_id = $1 ORDER BY created_at DESC, id DESC LIMIT 100`,
             [w.id]
@@ -1061,16 +1137,9 @@ const capturePaypalTopup = async (req, res, next) => {
         if (!payment) return bad(res, 'Payment not found', 404);
         if (payment.status === 'completed') return res.json({ message: 'Payment already added to your wallet', already: true });
 
-        const cap = await paypal.captureOrder(paypalOrderId);
-        const charged = Number(payment.paid_amount ?? payment.amount); // amount + platform fee
-        if (cap.status !== 'COMPLETED' || cap.currency !== 'USD' || Math.abs(Number(cap.amount) - charged) > 0.009) {
-            await query(`UPDATE client_payments SET status = 'failed', updated_at = NOW() WHERE id = $1 AND status = 'pending'`, [payment.id]);
-            return bad(res, `PayPal did not complete the payment (status: ${cap.status || 'unknown'}). You have not been charged by us.`);
-        }
-        const fee = Number(payment.fee_amount || 0);
-        const credited = await creditTopup(payment, { sql: 'paypal_capture_id = $1', value: cap.captureId },
-            `Wallet top-up via PayPal – paid $${charged.toFixed(2)}${fee ? ` incl. $${fee.toFixed(2)} platform fee` : ''} (${cap.captureId || paypalOrderId})`);
-        res.json(await topupResult(req.client.id, payment.amount, credited));
+        const done = await finishPaypalPayment(payment);
+        if (!done.ok) return bad(res, done.message);
+        res.json(await topupResult(req.client.id, payment.amount, done.credited));
     } catch (error) {
         next(error);
     }
@@ -1088,7 +1157,9 @@ const createRazorpayTopup = async (req, res, next) => {
         if (razorpay.mode() === 'live' && !onRailway) return res.status(503).json({ error: 'Not Configured', message: 'Live Razorpay keys are only used on the live server – use test keys (rzp_test_…) locally' });
         const options = await paymentOptions(await clientCountry(req.client.id));
         if (options.needs_country) return bad(res, 'Please add your country in your profile first');
-        if (!options.razorpay.available) return bad(res, 'Razorpay is only for clients in India – please use PayPal');
+        if (options.country_code !== 'IN') return bad(res, 'Razorpay is only for clients in India – please use PayPal');
+        // India, but the admin hasn't set the ₹ rate yet (Admin → Marketplace Pricing → ₹ per $1)
+        if (!options.razorpay.available) return res.status(503).json({ error: 'Not Configured', message: 'Top-ups in ₹ are not open yet – please try again later or contact support' });
         const amount = topupAmount(req.body.amount);
         if (!(await checkAmount(res, req.client.id, amount))) return;
 

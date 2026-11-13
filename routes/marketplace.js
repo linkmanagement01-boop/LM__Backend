@@ -79,6 +79,12 @@ router.put('/:marketplace/cart/:id', m.requireClient, m.requireActive, m.updateC
 router.delete('/:marketplace/cart/:id', m.requireClient, m.requireActive, m.removeCartItem);
 router.post('/:marketplace/checkout', m.requireClient, m.requireActive, m.checkout);
 
+// Outreach requests: a Pro client asks us to get a site we don't have yet (client sees them read-only)
+const outreach = require('../controllers/marketplaceOutreachController');
+router.get('/:marketplace/outreach', m.requireClient, m.requireActive, outreach.myRequests);
+router.post('/:marketplace/outreach', m.requireClient, m.requireActive, outreach.createRequest);
+router.post('/:marketplace/outreach/bulk', m.requireClient, m.requireActive, outreach.createBulk);
+
 router.get('/:marketplace/orders', m.requireClient, m.requireActive, m.getOrders);
 router.get('/:marketplace/orders/:id', m.requireClient, m.requireActive, m.getOrder);
 

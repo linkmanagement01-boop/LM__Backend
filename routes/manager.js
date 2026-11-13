@@ -123,6 +123,11 @@ router.put('/client-orders/:id', managerController.updateClientOrder);
 router.post('/client-orders/:id/reject', managerController.rejectClientOrder);
 // Push client order to blogger (converts to normal order flow)
 router.post('/client-orders/:id/push-to-blogger', managerController.pushClientOrderToBlogger);
+
+// Marketplace outreach requests (clients asking for sites we don't have) – same view as admin
+const marketplaceOutreach = require('../controllers/marketplaceOutreachController');
+router.get('/marketplace/outreach', marketplaceOutreach.listRequests);
+router.put('/marketplace/outreach/:id', marketplaceOutreach.updateStatus);
 // Send client order to writer
 router.post('/client-orders/:id/send-to-writer', managerController.sendClientOrderToWriter);
 
