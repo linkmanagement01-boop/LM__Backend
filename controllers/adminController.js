@@ -77,7 +77,7 @@ const createUser = async (req, res, next) => {
         }
 
         // Validate role
-        const validRoles = ['Admin', 'Manager', 'Team', 'Writer', 'Blogger', 'Accountant', 'Client'];
+        const validRoles = ['Admin', 'Manager', 'Team', 'Writer', 'Blogger', 'Accountant', 'Client', 'Outreach'];
         if (!validRoles.includes(role)) {
             return res.status(400).json({
                 error: 'Validation Error',
@@ -3668,7 +3668,9 @@ const updateUserPermissions = async (req, res, next) => {
                 'team member': 'team',
                 'writer': 'writer',
                 'blogger': 'vendor',
-                'accountant': 'accountant'
+                'accountant': 'accountant',
+                'outreach': 'outreach',
+                'outreach team': 'outreach'
             };
 
             if (validRolesMap[incomingRole]) {
