@@ -98,4 +98,21 @@ const captureOrder = async (paypalOrderId) => {
     }
 };
 
-module.exports = { isConfigured, createOrder, captureOrder, clientId: () => (process.env.PAYPAL_CLIENT_ID || '').trim(), mode: () => (String(process.env.PAYPAL_MODE || 'sandbox').toLowerCase() === 'live' ? 'live' : 'sandbox') };
+/**
+ * Look up an order without changing it → { status } where status is PayPal's order status:
+ * CREATED (client never approved), APPROVED (approved, waiting for our capture), COMPLETED (captured), VOIDED …
+ */
+const getOrder = async (paypalOrderId) => {
+    try {
+        const token = await getAccessToken();
+        const res = await axios.get(`${baseUrl()}/v2/checkout/orders/${encodeURIComponent(paypalOrderId)}`, {
+            headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+        });
+        return { status: res.data?.status || 'UNKNOWN' };
+    } catch (err) {
+        if (err.response?.status === 404) return { status: 'NOT_FOUND' }; // expired / unknown order
+        throw paypalError(err, 'order lookup');
+    }
+};
+
+module.exports = { isConfigured, createOrder, captureOrder, getOrder, clientId: () => (process.env.PAYPAL_CLIENT_ID || '').trim(), mode: () => (String(process.env.PAYPAL_MODE || 'sandbox').toLowerCase() === 'live' ? 'live' : 'sandbox') };
