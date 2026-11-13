@@ -22,6 +22,7 @@ const ROLE_MAP = {
     'Blogger': 'vendor',  // Production uses 'vendor' for bloggers
     'Accountant': 'accountant',
     'Client': 'client',
+    'Outreach': 'outreach', // Outreach Team (marketplace outreach tasks)
     'SuperAdmin': 'super_admin'
 };
 
@@ -33,6 +34,7 @@ const ROLE_MAP_REVERSE = {
     'vendor': 'Blogger',
     'accountant': 'Accountant',
     'client': 'Client',
+    'outreach': 'Outreach',
     'super_admin': 'SuperAdmin'
 };
 

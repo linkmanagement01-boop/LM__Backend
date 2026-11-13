@@ -235,6 +235,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/public', require('./routes/public')); // public website content (FAQ page)
 app.use('/api/admin', adminRoutes);
 app.use('/api/team', teamRoutes);
+app.use('/api/outreach', require('./routes/outreach')); // Outreach Team panel (marketplace outreach tasks)
 app.use('/api/manager', managerRoutes);
 app.use('/api/writer', writerRoutes);
 app.use('/api/blogger', bloggerRoutes);

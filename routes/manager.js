@@ -127,7 +127,12 @@ router.post('/client-orders/:id/push-to-blogger', managerController.pushClientOr
 // Marketplace outreach requests (clients asking for sites we don't have) – same view as admin
 const marketplaceOutreach = require('../controllers/marketplaceOutreachController');
 router.get('/marketplace/outreach', marketplaceOutreach.listRequests);
+router.get('/marketplace/outreach/members', marketplaceOutreach.listMembers);
 router.put('/marketplace/outreach/:id', marketplaceOutreach.updateStatus);
+router.put('/marketplace/outreach/:id/assign', marketplaceOutreach.assignRequest);
+router.put('/marketplace/outreach/:id/details', marketplaceOutreach.saveDetailsStaff);
+router.post('/marketplace/outreach/:id/approve', marketplaceOutreach.approveRequest);
+router.post('/marketplace/outreach/:id/send-back', marketplaceOutreach.sendBack);
 // Send client order to writer
 router.post('/client-orders/:id/send-to-writer', managerController.sendClientOrderToWriter);
 

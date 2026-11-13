@@ -141,7 +141,12 @@ router.put('/marketplace/payment-settings', marketplaceAdminController.updatePay
 // Marketplace outreach requests (clients asking for sites we don't have)
 const marketplaceOutreach = require('../controllers/marketplaceOutreachController');
 router.get('/marketplace/outreach', marketplaceOutreach.listRequests);
+router.get('/marketplace/outreach/members', marketplaceOutreach.listMembers);
 router.put('/marketplace/outreach/:id', marketplaceOutreach.updateStatus);
+router.put('/marketplace/outreach/:id/assign', marketplaceOutreach.assignRequest);
+router.put('/marketplace/outreach/:id/details', marketplaceOutreach.saveDetailsStaff);
+router.post('/marketplace/outreach/:id/approve', marketplaceOutreach.approveRequest);
+router.post('/marketplace/outreach/:id/send-back', marketplaceOutreach.sendBack);
 router.get('/sites/deleted-list', adminController.getDeletedWebsitesList);
 router.put('/sites/:id/delete', adminController.deleteWebsite);
 router.put('/sites/:id/restore', adminController.restoreWebsite);
