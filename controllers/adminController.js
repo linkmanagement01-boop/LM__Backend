@@ -1587,7 +1587,8 @@ const previewSitesExcel = async (req, res, next) => {
                     marked_sponsor: getVal(row, ['Marked Sponsor', 'marked_sponsor']) || '',
                     accept_grey_niche: getVal(row, ['Grey Niche', 'grey_niche', 'accept_grey_niche']) || '',
                     total_time: getVal(row, ['Total time', 'total_time']),
-                    href_url: getVal(row, ['Href url', 'href_url']) || '',
+                    // 'Href url' is no longer part of the upload sheet – ignored even if an old sheet still has it
+                    // (new sites get it empty; existing sites keep their saved value)
                     site_status: getVal(row, ['Status', 'status']) || '1',
                     domain_type: getVal(row, ['Domain Type', 'domain_type']) || '',
                     association_type: getVal(row, ['Association Type', 'association_type']) || ''
