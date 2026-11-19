@@ -68,6 +68,10 @@ router.post('/users/:id/wallet/add', adminController.addManualWalletBalance);
 router.post('/users/:id/wallet/withdraw', adminController.withdrawManualWalletBalance);
 
 // ==================== BLOGGER PERFORMANCE ====================
+// Bloggers clean-up: every matching id, bulk deactivate, bulk safe delete (before the /bloggers/:id routes)
+router.get('/bloggers/ids', adminController.getBloggerIds);
+router.post('/bloggers/bulk-status', adminController.bulkBloggerStatus);
+router.post('/bloggers/bulk-delete', adminController.bulkDeleteBloggers);
 router.get('/bloggers/:id/performance', adminController.getBloggerPerformance);
 router.delete('/bloggers/:id', adminController.deleteBlogger);
 router.get('/bloggers/:id/delete-blockers', adminController.getBloggerDeleteBlockers);

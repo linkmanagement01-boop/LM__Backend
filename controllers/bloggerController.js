@@ -742,13 +742,21 @@ const addSite = async (req, res, next) => {
             spam_score, traffic_source, fc_gp, fc_ne, total_time, marked_sponsor, accept_grey
         } = req.body;
 
-        const domainToUse = root_domain || domain_url;
+        // Saved as the bare domain only – "https://www.ABC.com/page" → "abc.com"
+        const domainToUse = String(root_domain || domain_url || '').trim().toLowerCase()
+            .replace(/^[a-z]+:\/\//, '').replace(/^www\./, '').replace(/[/?#].*$/, '').replace(/:\d+$/, '').replace(/\.$/, '');
 
         // Validation
         if (!domainToUse) {
             return res.status(400).json({
                 error: 'Validation Error',
                 message: 'Domain URL is required'
+            });
+        }
+        if (!/^([a-z0-9](-*[a-z0-9])*)(\.[a-z0-9](-*[a-z0-9])*)*\.[a-z]{2,}$/.test(domainToUse)) {
+            return res.status(400).json({
+                error: 'Validation Error',
+                message: 'Enter only the domain, e.g. abc.com – no http://, https://, www. or /page'
             });
         }
 
@@ -784,7 +792,7 @@ const addSite = async (req, res, next) => {
                 gp_price || 0,
                 req.user.id,
                 sample_url || null,
-                email || null,
+                email || req.user.email || null, // the blogger's own email, so the Sites list can show the mail icon
                 spam_score || null,
                 traffic_source || null,
                 fc_gp || null,

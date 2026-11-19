@@ -741,6 +741,7 @@ const getAllWithdrawals = async (req, res, next) => {
 // ==================== WALLET MANAGEMENT ====================
 
 const { query } = require('../config/database');
+const { applyDomainSearch } = require('../utils/domainSearch');
 /**
  * @route   GET /api/admin/wallet/bloggers
  * @desc    Get all bloggers with their wallet balances with pagination
@@ -2161,11 +2162,6 @@ const getWebsitesList = async (req, res, next) => {
         let paramIndex = 1;
 
         // Text Search Filters
-        if (req.query.search_domain) {
-            conditions.push(`ns.root_domain ILIKE $${paramIndex}`);
-            queryParams.push(`%${req.query.search_domain}%`);
-            paramIndex++;
-        }
         if (req.query.search_category) {
             conditions.push(`(ns.category ILIKE $${paramIndex} OR ns.niche ILIKE $${paramIndex})`);
             queryParams.push(`%${req.query.search_category}%`);
@@ -2177,7 +2173,7 @@ const getWebsitesList = async (req, res, next) => {
             paramIndex++;
         }
         if (req.query.search_email) {
-            conditions.push(`ns.email ILIKE $${paramIndex}`);
+            conditions.push(`COALESCE(NULLIF(TRIM(ns.email), ''), (SELECT ou.email FROM users ou WHERE ou.id = ns.uploaded_user_id AND LOWER(ou.role) IN ('vendor', 'blogger'))) ILIKE $${paramIndex}`);
             queryParams.push(`%${req.query.search_email}%`);
             paramIndex++;
         }
@@ -2240,6 +2236,11 @@ const getWebsitesList = async (req, res, next) => {
         const orderBy = applySiteFilters(req.query, conditions, queryParams);
         paramIndex = queryParams.length + 1;
 
+        // Domain search last (it looks at the other filters): names starting with it first, else containing it –
+        // the ending (.com, .net …) is ignored
+        await applyDomainSearch(req.query.search_domain, conditions, queryParams);
+        paramIndex = queryParams.length + 1;
+
         const whereClause = conditions.join(' AND ');
 
         // Execute Count query (same filters, no pagination)
@@ -2256,7 +2257,7 @@ const getWebsitesList = async (req, res, next) => {
             `SELECT ns.id, ns.root_domain, ns.niche, ns.category,
                 ns.da, ns.dr, ns.rd, ns.spam_score, ns.traffic_source as traffic,
                 ns.gp_price, ns.niche_edit_price, ns.deal_cbd_casino,
-                ns.email, ns.site_status, ns.website_status,
+                COALESCE(NULLIF(TRIM(ns.email), ''), (SELECT ou.email FROM users ou WHERE ou.id = ns.uploaded_user_id AND LOWER(ou.role) IN ('vendor', 'blogger'))) AS email, ns.site_status, ns.website_status, -- no saved email → the blogger who added it
                 ns.fc_gp, ns.fc_ne, ns.website_niche, ns.sample_url, ns.href_url,
                 ns.paypal_id, ns.skype, ns.whatsapp, ns.country_source,
                 ns.created_at, ns.updated_at,
@@ -2314,11 +2315,6 @@ const getDeletedWebsitesList = async (req, res, next) => {
         let paramIndex = 1;
 
         // Text Search Filters
-        if (req.query.search_domain) {
-            conditions.push(`ns.root_domain ILIKE $${paramIndex}`);
-            queryParams.push(`%${req.query.search_domain}%`);
-            paramIndex++;
-        }
         if (req.query.search_category) {
             conditions.push(`(ns.category ILIKE $${paramIndex} OR ns.niche ILIKE $${paramIndex})`);
             queryParams.push(`%${req.query.search_category}%`);
@@ -2330,7 +2326,7 @@ const getDeletedWebsitesList = async (req, res, next) => {
             paramIndex++;
         }
         if (req.query.search_email) {
-            conditions.push(`ns.email ILIKE $${paramIndex}`);
+            conditions.push(`COALESCE(NULLIF(TRIM(ns.email), ''), (SELECT ou.email FROM users ou WHERE ou.id = ns.uploaded_user_id AND LOWER(ou.role) IN ('vendor', 'blogger'))) ILIKE $${paramIndex}`);
             queryParams.push(`%${req.query.search_email}%`);
             paramIndex++;
         }
@@ -2389,6 +2385,11 @@ const getDeletedWebsitesList = async (req, res, next) => {
         addRangeFilter('gp_price', 'ns.gp_price');
         addRangeFilter('niche_price', 'ns.niche_edit_price');
 
+        // Domain search last (it looks at the other filters): names starting with it first, else containing it –
+        // the ending (.com, .net …) is ignored
+        await applyDomainSearch(req.query.search_domain, conditions, queryParams);
+        paramIndex = queryParams.length + 1;
+
         const whereClause = conditions.join(' AND ');
 
         // Execute Count query (same filters, no pagination)
@@ -2405,7 +2406,7 @@ const getDeletedWebsitesList = async (req, res, next) => {
             `SELECT ns.id, ns.root_domain, ns.niche, ns.category,
                 ns.da, ns.dr, ns.rd, ns.spam_score, ns.traffic_source as traffic,
                 ns.gp_price, ns.niche_edit_price, ns.deal_cbd_casino,
-                ns.email, ns.site_status, ns.website_status,
+                COALESCE(NULLIF(TRIM(ns.email), ''), (SELECT ou.email FROM users ou WHERE ou.id = ns.uploaded_user_id AND LOWER(ou.role) IN ('vendor', 'blogger'))) AS email, ns.site_status, ns.website_status, -- no saved email → the blogger who added it
                 ns.fc_gp, ns.fc_ne, ns.website_niche, ns.sample_url, ns.href_url,
                 ns.paypal_id, ns.skype, ns.whatsapp, ns.country_source,
                 ns.created_at, ns.updated_at,
@@ -3199,26 +3200,104 @@ const deleteCountry = async (req, res, next) => {
  * @desc    Get all bloggers with stats (wallet, orders) for admin list
  * @access  Admin only
  */
+/**
+ * WHERE clause for the Bloggers list, shared by the list, "select all matching" and the bulk actions.
+ * Clean-up filters (to find junk accounts):
+ *   no_sites=1         – no site added by them AND none uploaded under their email
+ *   older_than_days=N  – account created more than N days ago
+ *   no_orders=1        – never had an order line
+ *   no_login_days=N    – no login in the last N days (or no login recorded at all)
+ *   never_logged_in=1  – no login recorded at all
+ *   account_status=active|inactive
+ */
+const bloggerListWhere = (q) => {
+    let where = "WHERE u.role IN ('vendor', 'Vendor', 'Blogger', 'blogger')";
+    const params = [];
+    const p = (v) => { params.push(v); return `$${params.length}`; };
+    if (q.name) where += ` AND LOWER(u.name) LIKE LOWER(${p(`%${q.name}%`)})`;
+    if (q.email) where += ` AND LOWER(u.email) LIKE LOWER(${p(`%${q.email}%`)})`;
+    if (q.no_sites === '1') {
+        where += ` AND NOT EXISTS (SELECT 1 FROM new_sites s WHERE s.uploaded_user_id = u.id)
+                   AND NOT EXISTS (SELECT 1 FROM new_sites s2 WHERE COALESCE(TRIM(s2.email), '') <> '' AND LOWER(TRIM(s2.email)) = LOWER(TRIM(u.email)))`;
+    }
+    const days = (v) => Math.min(3650, Math.max(1, parseInt(v) || 0));
+    if (parseInt(q.older_than_days) > 0) where += ` AND u.created_at < NOW() - (${p(days(q.older_than_days))} || ' days')::interval`;
+    if (q.no_orders === '1') where += ` AND NOT EXISTS (SELECT 1 FROM new_order_process_details d WHERE d.vendor_id = u.id)`;
+    if (parseInt(q.no_login_days) > 0) where += ` AND (u.last_login IS NULL OR u.last_login < NOW() - (${p(days(q.no_login_days))} || ' days')::interval)`;
+    if (q.never_logged_in === '1') where += ` AND u.last_login IS NULL AND COALESCE(u.login_count, 0) = 0`;
+    if (q.account_status === 'active') where += ` AND u.status = 1`;
+    if (q.account_status === 'inactive') where += ` AND u.status <> 1`;
+    return { where, params };
+};
+
+/** @route GET /api/admin/bloggers/ids?<same filters> – every matching blogger id (for "select all matching") */
+const getBloggerIds = async (req, res, next) => {
+    try {
+        const { where, params } = bloggerListWhere(req.query);
+        const r = await query(`SELECT u.id FROM users u ${where} ORDER BY u.id LIMIT 100000`, params);
+        res.json({ ids: r.rows.map(x => Number(x.id)), total: r.rows.length });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/** @route POST /api/admin/bloggers/bulk-status  { ids: [], status: 0|1 } – Deactivate / Activate many at once */
+const bulkBloggerStatus = async (req, res, next) => {
+    try {
+        const ids = [...new Set((req.body.ids || []).map(Number).filter(Boolean))].slice(0, 100000);
+        const status = Number(req.body.status) === 1 ? 1 : 0;
+        if (!ids.length) return res.status(400).json({ message: 'No bloggers selected' });
+        const r = await query(
+            `UPDATE users SET status = $1, updated_at = NOW() WHERE id = ANY($2::bigint[]) AND LOWER(role) IN ('vendor', 'blogger') AND status IS DISTINCT FROM $1`,
+            [status, ids]
+        );
+        logger.info('Admin', `Bulk ${status ? 'activate' : 'deactivate'} by admin ${req.user.id}: ${r.rowCount} bloggers`);
+        res.json({ message: `${r.rowCount} blogger${r.rowCount === 1 ? '' : 's'} ${status ? 'activated' : 'deactivated'}`, updated: r.rowCount });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * @route POST /api/admin/bloggers/bulk-delete  { ids: [] } – up to 200 per call (the page sends batches)
+ * Every blogger goes through the same safety check as the single Delete; anyone with orders, wallet money,
+ * payouts or sites used in orders is skipped (with the reason), never deleted.
+ */
+const bulkDeleteBloggers = async (req, res, next) => {
+    try {
+        const ids = [...new Set((req.body.ids || []).map(Number).filter(Boolean))].slice(0, 200);
+        if (!ids.length) return res.status(400).json({ message: 'No bloggers selected' });
+        const users = (await query(`SELECT id, name, email FROM users WHERE id = ANY($1::bigint[]) AND LOWER(role) IN ('vendor', 'blogger')`, [ids])).rows;
+        let deleted = 0;
+        const skipped = [];
+        for (const u of users) {
+            try {
+                const blockers = await getDeletionBlockers(u.id);
+                if (blockers.length) { skipped.push({ id: Number(u.id), name: u.name, email: u.email, reason: blockers.join(' ') }); continue; }
+                await deleteBloggerData(u.id);
+                deleted++;
+            } catch (err) {
+                skipped.push({ id: Number(u.id), name: u.name, email: u.email, reason: `Not deleted: ${err.message}` });
+            }
+        }
+        logger.info('Admin', `Bulk delete by admin ${req.user.id}: ${deleted} bloggers deleted, ${skipped.length} skipped`);
+        res.json({ deleted, skipped, not_found: ids.length - users.length });
+    } catch (error) {
+        next(error);
+    }
+};
+
 const getBloggerStats = async (req, res, next) => {
     try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 20;
         const offset = (page - 1) * limit;
-        const { name, email, walletMin, walletMax } = req.query;
 
-        // Build WHERE clause
-        let whereClause = "WHERE u.role IN ('vendor', 'Vendor', 'Blogger', 'blogger')";
-        const params = [];
-        let paramIndex = 1;
-
-        if (name) {
-            whereClause += ` AND LOWER(u.name) LIKE LOWER($${paramIndex++})`;
-            params.push(`%${name}%`);
-        }
-        if (email) {
-            whereClause += ` AND LOWER(u.email) LIKE LOWER($${paramIndex++})`;
-            params.push(`%${email}%`);
-        }
+        // Build WHERE clause (name, email + the clean-up filters)
+        const built = bloggerListWhere(req.query);
+        const whereClause = built.where;
+        const params = built.params;
+        let paramIndex = params.length + 1;
 
         // Get total count
         const countResult = await query(`SELECT COUNT(*) as total FROM users u ${whereClause}`, params);
@@ -4238,6 +4317,9 @@ module.exports = {
     // getWebsitesList, // Already listed above
     // Bloggers Stats
     getBloggerStats,
+    getBloggerIds,
+    bulkBloggerStatus,
+    bulkDeleteBloggers,
     // Careers Management
     getCareers,
     createCareer,
