@@ -3,6 +3,7 @@ const Transaction = require('../models/Transaction');
 const { isTransitionAllowed } = require('../utils/statusTransitions');
 const { addCreditToBloggerWallet, processWithdrawalApproval } = require('../utils/walletService');
 const { query, transaction } = require('../config/database');
+const { applyDomainSearch } = require('../utils/domainSearch');
 const logger = require('../utils/logger');
 const { notifyLinkLive, notifyRefund } = require('../utils/marketplaceNotify');
 const { applySiteFilters, siteCategories, statusCode } = require('../utils/siteListFilters');
@@ -1916,11 +1917,6 @@ const getWebsites = async (req, res, next) => {
         let paramIndex = 1;
 
         // Text Search Filters
-        if (req.query.search_domain) {
-            conditions.push(`ns.root_domain ILIKE $${paramIndex}`);
-            queryParams.push(`%${req.query.search_domain}%`);
-            paramIndex++;
-        }
         if (req.query.search_category) {
             conditions.push(`(ns.category ILIKE $${paramIndex} OR ns.niche ILIKE $${paramIndex})`);
             queryParams.push(`%${req.query.search_category}%`);
@@ -1932,7 +1928,7 @@ const getWebsites = async (req, res, next) => {
             paramIndex++;
         }
         if (req.query.search_email) {
-            conditions.push(`ns.email ILIKE $${paramIndex}`);
+            conditions.push(`COALESCE(NULLIF(TRIM(ns.email), ''), (SELECT ou.email FROM users ou WHERE ou.id = ns.uploaded_user_id AND LOWER(ou.role) IN ('vendor', 'blogger'))) ILIKE $${paramIndex}`);
             queryParams.push(`%${req.query.search_email}%`);
             paramIndex++;
         }
@@ -2000,6 +1996,11 @@ const getWebsites = async (req, res, next) => {
         const orderBy = applySiteFilters(req.query, conditions, queryParams);
         paramIndex = queryParams.length + 1;
 
+        // Domain search last (it looks at the other filters): names starting with it first, else containing it –
+        // the ending (.com, .net …) is ignored
+        await applyDomainSearch(req.query.search_domain, conditions, queryParams);
+        paramIndex = queryParams.length + 1;
+
         const whereClause = conditions.join(' AND ');
 
         // Execute Count query (same filters, no pagination)
@@ -2016,7 +2017,7 @@ const getWebsites = async (req, res, next) => {
             `SELECT ns.id, ns.root_domain, ns.niche, ns.category,
                 ns.da, ns.dr, ns.rd, ns.spam_score, ns.traffic_source as traffic,
                 ns.gp_price, ns.niche_edit_price, ns.deal_cbd_casino,
-                ns.email, ns.site_status, ns.website_status,
+                COALESCE(NULLIF(TRIM(ns.email), ''), (SELECT ou.email FROM users ou WHERE ou.id = ns.uploaded_user_id AND LOWER(ou.role) IN ('vendor', 'blogger'))) AS email, ns.site_status, ns.website_status, -- no saved email → the blogger who added it
                 ns.fc_gp, ns.fc_ne, ns.website_niche, ns.sample_url, ns.href_url,
                 ns.paypal_id, ns.skype, ns.whatsapp, ns.country_source,
                 ns.created_at, ns.updated_at,

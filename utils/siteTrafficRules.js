@@ -95,7 +95,67 @@ const list = async (tab) => {
          FROM site_traffic st JOIN new_sites ns ON ns.id = st.site_id
          WHERE st.rule_action = $1 AND ${OPEN_SQL}
          ORDER BY ${action === 'suggested' ? 'st.organic_traffic DESC' : 'st.rule_at DESC'}`, [action]);
-    return r.rows;
+    return withHistory(r.rows);
+};
+
+// "www.Site.com/" and "https://site.com" are the same domain
+const KEY_SQL = (a) => `LOWER(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(TRIM(${a}.root_domain), '^https?://', '', 'i'), '^www\\.', '', 'i'), '/.*$', ''))`;
+const keyOf = (d) => String(d || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '');
+
+/**
+ * Adds to every listed site what a manager checks before deciding:
+ *   duplicates – other rows in Sites with the same domain (status, prices, blogger, Ahrefs traffic)
+ *   rejected_orders – order lines on this domain (any copy) that were rejected by a manager or refused by the blogger
+ *                     (same rule as Manager → Rejected Orders → Bloggers, plus blogger refusals)
+ */
+const withHistory = async (sites) => {
+    if (!sites.length) return sites;
+    const keys = [...new Set(sites.map(s => keyOf(s.root_domain)))];
+    const [dups, rejected] = await Promise.all([
+        query(
+            `SELECT ns.id, ns.root_domain, ${KEY_SQL('ns')} AS key, ns.site_status, ns.gp_price, ns.niche_edit_price, ns.fc_gp, ns.fc_ne,
+                    ns.email, ns.created_at, (ns.delete_site = 1) AS deleted, u.name AS blogger_name, u.email AS blogger_email,
+                    st.organic_traffic::float8 AS ahrefs_traffic, st.checked_at AS ahrefs_checked_at
+             FROM new_sites ns
+             LEFT JOIN users u ON u.id = ns.uploaded_user_id
+             LEFT JOIN site_traffic st ON st.site_id = ns.id
+             WHERE ${KEY_SQL('ns')} = ANY($1::text[])
+             ORDER BY ns.created_at`, [keys]),
+        query(
+            `SELECT nopd.id AS line_id, o.id AS order_pk, o.order_id, o.order_type, ${KEY_SQL('ns')} AS key, ns.id AS site_id,
+                    nopd.status, nopd.reject_reason, nopd.updated_at, u.name AS blogger_name, u.email AS blogger_email
+             FROM new_order_process_details nopd
+             JOIN new_order_processes nop ON nop.id = nopd.new_order_process_id
+             JOIN new_orders o ON o.id = nop.new_order_id
+             JOIN new_sites ns ON ns.id = nopd.new_site_id
+             LEFT JOIN users u ON u.id = nopd.vendor_id
+             WHERE ${KEY_SQL('ns')} = ANY($1::text[])
+               AND (nopd.status IN (11, 12) OR (nopd.reject_reason IS NOT NULL AND TRIM(nopd.reject_reason) <> ''))
+               AND o.order_id NOT LIKE 'CLT-%'
+             ORDER BY nopd.updated_at DESC`, [keys])
+    ]);
+    const STATUS = { 1: 'Approved', 2: 'Rejected', 0: 'Pending' };
+    return sites.map(s => {
+        const key = keyOf(s.root_domain);
+        return {
+            ...s,
+            duplicates: dups.rows.filter(d => d.key === key && String(d.id) !== String(s.id)).map(d => ({
+                id: d.id, root_domain: d.root_domain, status: d.deleted ? 'Deleted' : (STATUS[d.site_status] || 'Pending'),
+                gp_price: d.gp_price, niche_edit_price: d.niche_edit_price, fc_gp: d.fc_gp, fc_ne: d.fc_ne,
+                email: d.email, blogger_name: d.blogger_name, blogger_email: d.blogger_email, created_at: d.created_at,
+                ahrefs_traffic: d.ahrefs_traffic, ahrefs_checked_at: d.ahrefs_checked_at
+            })),
+            rejected_orders: rejected.rows.filter(r => r.key === key).slice(0, 25).map(r => ({
+                line_id: r.line_id, order_pk: r.order_pk, order_id: r.order_id, order_type: r.order_type,
+                site_id: r.site_id, same_site: String(r.site_id) === String(s.id),
+                // 11 = rejected by a manager, 12 = refused by the blogger; other statuses = a reason left from an earlier rejection
+                by: Number(r.status) === 12 ? 'blogger' : 'manager',
+                status: Number(r.status), reason: (r.reject_reason || '').trim(), date: r.updated_at,
+                blogger_name: r.blogger_name, blogger_email: r.blogger_email
+            })),
+            rejected_orders_total: rejected.rows.filter(r => r.key === key).length
+        };
+    });
 };
 
 /**
@@ -121,4 +181,4 @@ const decide = async (siteId, decision, userId) => {
     return { ok: true, site_status: newStatus || '2' };
 };
 
-module.exports = { AUTO_REJECT_MAX, SUGGEST_MIN, GROWTH_MIN_PCT, growth, applyRules, counts, list, decide };
+module.exports = { withHistory, AUTO_REJECT_MAX, SUGGEST_MIN, GROWTH_MIN_PCT, growth, applyRules, counts, list, decide };
