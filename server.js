@@ -189,9 +189,15 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' },
   // a developer's own PC (npm run dev, not on Railway) isn't limited – every tab and test shares one IP there
-  skip: () => process.env.NODE_ENV === 'development' && !(process.env.RAILWAY_ENVIRONMENT_NAME || process.env.RAILWAY_PROJECT_ID)
+  skip: (req) => (process.env.NODE_ENV === 'development' && !(process.env.RAILWAY_ENVIRONMENT_NAME || process.env.RAILWAY_PROJECT_ID))
+    || req.path.startsWith('/admin/contact-finder/') // has its own limit below – one request per domain would use up 300 in one list
 });
 app.use('/api/', apiLimiter);
+// Contact Finder: one request per domain (lists of up to 200) – its own, higher limit (the controller also caps parallel checks)
+app.use('/api/admin/contact-finder/', rateLimit({
+  windowMs: 15 * 60 * 1000, max: 1200, standardHeaders: true, legacyHeaders: false,
+  message: { message: 'Too many Contact Finder checks – wait a few minutes and click Check the remaining.' }
+}));
 
 // Razorpay webhook needs the raw body to check its signature – registered before the JSON parser
 if (process.env.MARKETPLACE_ENABLED === 'true') {
