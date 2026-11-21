@@ -125,6 +125,7 @@ router.get('/sites/categories', adminController.getSiteCategories);
 router.get('/sites/:id/traffic', siteTrafficController.getSiteTraffic);
 router.post('/sites/:id/traffic', siteTrafficController.saveSiteTraffic);
 router.post('/traffic/lookup', siteTrafficController.lookupTraffic); // Traffic Lookup tool – nothing saved
+router.post('/contact-finder/check', require('../controllers/contactFinderController').checkDomain); // Contact Finder – public e-mails + social profiles, nothing saved
 // Suggestions page (status rules after Ahrefs checks)
 router.get('/sites/traffic-suggestions', siteTrafficController.getTrafficSuggestions);
 router.get('/sites/traffic-queue', siteTrafficController.getTrafficQueue);
